@@ -4,6 +4,9 @@ const std = @import("std");
 // declaratively construct a build graph that will be executed by an external
 // runner.
 pub fn build(b: *std.Build) void {
+    const options = b.addOptions();
+    const options_mod = options.createModule();
+
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -14,29 +17,36 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const root_source_file = b.path("src/main.zig");
 
     // Dependencies
     const vaxis_dep = b.dependency("vaxis", .{
         .optimize = optimize,
         .target = target,
     });
-
+    const zg_dep = b.dependency("zg", .{
+        .optimize = optimize,
+        .target = target,
+    });
     const kui_mod = b.addModule("kui", .{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = root_source_file,
         .target = target,
         .optimize = optimize,
     });
 
-    kui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+    kui_mod.addImport("code_point", zg_dep.module("code_point"));
+    kui_mod.addImport("grapheme", zg_dep.module("grapheme"));
+    kui_mod.addImport("DisplayWidth", zg_dep.module("DisplayWidth"));
+    kui_mod.addImport("build_options", options_mod);
 
     const kui = b.addExecutable(.{
         .name = "kui",
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = root_source_file,
         .target = target,
         .optimize = optimize,
     });
 
-    kui.root_module.addImport("kui", kui_mod);
+    kui.root_module.addImport("vaxis", vaxis_dep.module("vaxis"));
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
