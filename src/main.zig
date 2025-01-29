@@ -1,6 +1,10 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const kafka = @import("kafka/client.zig");
 const vxfw = vaxis.vxfw;
+const c = @cImport({
+    @cInclude("librdkafka/rdkafka.h");
+});
 
 /// Our main application state
 const Model = struct {
@@ -8,6 +12,8 @@ const Model = struct {
     count: u32 = 0,
     /// The button. This widget is stateful and must live between frames
     button: vxfw.Button,
+    text: ?[]u8 = null,
+    allocator: std.mem.Allocator,
 
     /// Helper function to return a vxfw.Widget struct
     pub fn widget(self: *Model) vxfw.Widget {
@@ -16,6 +22,10 @@ const Model = struct {
             .eventHandler = Model.typeErasedEventHandler,
             .drawFn = Model.typeErasedDrawFn,
         };
+    }
+
+    pub fn deinit(self: *Model) void {
+        self.allocator.free(self.text);
     }
 
     /// This function will be called from the vxfw runtime.
@@ -62,6 +72,9 @@ const Model = struct {
         const count_text = try std.fmt.allocPrint(ctx.arena, "{d}", .{self.count});
         const text: vxfw.Text = .{ .text = count_text };
 
+        const hello_text = try std.fmt.allocPrint(ctx.arena, "{?s}", .{self.text});
+        const hello: vxfw.Text = .{ .text = hello_text };
+
         // Each widget returns a Surface from it's draw function. A Surface contains the rectangular
         // area of the widget, as well as some information about the surface or widget: can we focus
         // it? does it handle the mouse?
@@ -76,6 +89,11 @@ const Model = struct {
             .surface = try text.draw(ctx),
         };
 
+        const hello_child: vxfw.SubSurface = .{
+            .origin = .{ .row = 6, .col = 0 },
+            .surface = try hello.draw(ctx),
+        };
+
         const button_child: vxfw.SubSurface = .{
             .origin = .{ .row = 2, .col = 0 },
             .surface = try self.button.draw(ctx.withConstraints(
@@ -88,9 +106,10 @@ const Model = struct {
 
         // We also can use our arena to allocate the slice for our SubSurfaces. This slice only
         // needs to live until the next frame, making this safe.
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
         children[0] = text_child;
         children[1] = button_child;
+        children[2] = hello_child;
 
         return .{
             // A Surface must have a size. Our root widget is the size of the screen
@@ -110,6 +129,7 @@ const Model = struct {
     fn onClick(maybe_ptr: ?*anyopaque, ctx: *vxfw.EventContext) anyerror!void {
         const ptr = maybe_ptr orelse return;
         const self: *Model = @ptrCast(@alignCast(ptr));
+
         self.count +|= 1;
         return ctx.consumeAndRedraw();
     }
@@ -124,10 +144,18 @@ pub fn main() !void {
     var app = try vxfw.App.init(allocator);
     defer app.deinit();
 
+    const version = c.rd_kafka_version();
+    const major = (version >> 24) & 0xFF;
+    const minor = (version >> 16) & 0xFF;
+    const revision = version & 0xFFFF;
+
     // We heap allocate our model because we will require a stable pointer to it in our Button
     // widget
     const model = try allocator.create(Model);
+    defer model.deinit();
     defer allocator.destroy(model);
+
+    const initial_text = try std.fmt.allocPrint(allocator, "Using librdkafka version: {d}.{d}.{d}", .{ major, minor, revision });
 
     // Set the initial state of our button
     model.* = .{
@@ -137,6 +165,8 @@ pub fn main() !void {
             .onClick = Model.onClick,
             .userdata = model,
         },
+        .text = initial_text,
+        .allocator = allocator,
     };
 
     try app.run(model.widget(), .{});

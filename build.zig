@@ -27,6 +27,9 @@ pub fn build(b: *std.Build) void {
         .vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize }),
     };
 
+    kui.linkLibC();
+    kui.linkSystemLibrary("rdkafka");
+
     kui.root_module.addImport("vaxis", deps.vaxis.module("vaxis"));
 
     b.installArtifact(kui);
