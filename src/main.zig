@@ -25,7 +25,9 @@ const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
-        self.allocator.free(self.text);
+        if (self.text) |text| {
+            self.allocator.free(text);
+        }
     }
 
     /// This function will be called from the vxfw runtime.
@@ -139,35 +141,46 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const allocator = gpa.allocator();
+    std.debug.print("hello world", .{});
 
-    var app = try vxfw.App.init(allocator);
-    defer app.deinit();
+    var client = try kafka.KafkaClient.init();
+    defer client.deinit(); // Clean up resources when done
 
-    const version = c.rd_kafka_version();
-    const major = (version >> 24) & 0xFF;
-    const minor = (version >> 16) & 0xFF;
-    const revision = version & 0xFFFF;
+    // Print initial message
+    std.debug.print("Kafka client initialized\n", .{});
 
-    // We heap allocate our model because we will require a stable pointer to it in our Button
-    // widget
-    const model = try allocator.create(Model);
-    defer model.deinit();
-    defer allocator.destroy(model);
+    // Try to get metadata
+    try client.getMetadata(5000); // 5000ms timeout
 
-    const initial_text = try std.fmt.allocPrint(allocator, "Using librdkafka version: {d}.{d}.{d}", .{ major, minor, revision });
-
-    // Set the initial state of our button
-    model.* = .{
-        .count = 0,
-        .button = .{
-            .label = "Click me!",
-            .onClick = Model.onClick,
-            .userdata = model,
-        },
-        .text = initial_text,
-        .allocator = allocator,
-    };
-
-    try app.run(model.widget(), .{});
+    // const allocator = gpa.allocator();
+    //
+    // var app = try vxfw.App.init(allocator);
+    // defer app.deinit();
+    //
+    // const version = c.rd_kafka_version();
+    // const major = (version >> 24) & 0xFF;
+    // const minor = (version >> 16) & 0xFF;
+    // const revision = version & 0xFFFF;
+    //
+    // // We heap allocate our model because we will require a stable pointer to it in our Button
+    // // widget
+    // const model = try allocator.create(Model);
+    // defer allocator.destroy(model);
+    // defer model.deinit();
+    //
+    // const initial_text = try std.fmt.allocPrint(allocator, "Using librdkafka version: {d}.{d}.{d}", .{ major, minor, revision });
+    //
+    // // Set the initial state of our button
+    // model.* = .{
+    //     .count = 0,
+    //     .button = .{
+    //         .label = "Click me!",
+    //         .onClick = Model.onClick,
+    //         .userdata = model,
+    //     },
+    //     .text = initial_text,
+    //     .allocator = allocator,
+    // };
+    //
+    // try app.run(model.widget(), .{});
 }
