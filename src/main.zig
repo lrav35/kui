@@ -141,16 +141,13 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    std.debug.print("hello world", .{});
+    var consumer = try kafka.KafkaClient.init(.Consumer, "my-group-id");
+    defer consumer.deinit();
 
-    var client = try kafka.KafkaClient.init();
-    defer client.deinit(); // Clean up resources when done
+    std.debug.print("Kafka consumer initialized\n", .{});
 
-    // Print initial message
-    std.debug.print("Kafka client initialized\n", .{});
-
-    // Try to get metadata
-    try client.getMetadata(5000); // 5000ms timeout
+    // Get metadata
+    try consumer.getMetadata(5000);
 
     // const allocator = gpa.allocator();
     //

@@ -7,40 +7,71 @@ pub const KafkaError = error{
     ConfigError,
     ClientCreationError,
     MetadataError,
+    SubscriptionError,
+    ConsumerError,
+    TopicPartitionError,
+};
+
+pub const ClientType = enum {
+    Producer,
+    Consumer,
 };
 
 pub const KafkaClient = struct {
     kafka_handle: ?*c.rd_kafka_t,
+    client_type: ClientType,
 
-    // Initialize the client
-    pub fn init() !KafkaClient {
-        // Create Kafka configuration
+    pub fn init(client_type: ClientType, group_id: ?[]const u8) !KafkaClient {
+        // Config
         const conf = c.rd_kafka_conf_new();
         if (conf == null) return KafkaError.ConfigError;
 
         // Configure the bootstrap servers
-        var errstr: [512]u8 = undefined;
+        var errstr: [512]u8 = [_]u8{0} ** 512;
         const bootstrap_servers = "localhost:9092";
         if (c.rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap_servers, &errstr, errstr.len) != c.RD_KAFKA_CONF_OK) {
             c.rd_kafka_conf_destroy(conf);
             return KafkaError.ConfigError;
         }
 
+        // If it's a consumer, set the group.id
+        if (client_type == .Consumer) {
+            if (group_id) |id| {
+                if (c.rd_kafka_conf_set(conf, "group.id", id.ptr, &errstr, errstr.len) != c.RD_KAFKA_CONF_OK) {
+                    c.rd_kafka_conf_destroy(conf);
+                    return KafkaError.ConfigError;
+                }
+            }
+            // Set auto.offset.reset to "earliest"
+            if (c.rd_kafka_conf_set(conf, "auto.offset.reset", "earliest", &errstr, errstr.len) != c.RD_KAFKA_CONF_OK) {
+                c.rd_kafka_conf_destroy(conf);
+                return KafkaError.ConfigError;
+            }
+        }
+
         // Create the Kafka handle
-        const kafka_handle = c.rd_kafka_new(c.RD_KAFKA_PRODUCER, conf, &errstr, errstr.len);
+        const kafka_type = @as(c_uint, @intCast(switch (client_type) {
+            .Producer => c.RD_KAFKA_PRODUCER,
+            .Consumer => c.RD_KAFKA_CONSUMER,
+        }));
+
+        const kafka_handle = c.rd_kafka_new(kafka_type, conf, &errstr, @as(usize, errstr.len));
         if (kafka_handle == null) {
             return KafkaError.ClientCreationError;
         }
 
         return KafkaClient{
             .kafka_handle = kafka_handle,
+            .client_type = client_type,
         };
     }
 
-    // Clean up resources
     pub fn deinit(self: *KafkaClient) void {
         if (self.kafka_handle) |handle| {
-            c.rd_kafka_destroy(handle);
+            if (self.client_type == .Consumer) {
+                _ = c.rd_kafka_consumer_close(handle);
+            }
+            _ = c.rd_kafka_destroy(handle);
         }
     }
 
