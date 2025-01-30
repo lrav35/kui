@@ -149,6 +149,18 @@ pub fn main() !void {
     // Get metadata
     try consumer.getMetadata(5000);
 
+    // Subscribe to topics
+    const topics = [_][]const u8{"kui-test"};
+    try consumer.subscribe(&topics);
+    std.debug.print("Subscribed to topics\n", .{});
+
+    // Consume messages in a loop
+    while (true) {
+        if (try consumer.consumeMessage(1000)) |msg| {
+            std.debug.print("Received message: {s}\n", .{msg});
+        }
+    }
+
     // const allocator = gpa.allocator();
     //
     // var app = try vxfw.App.init(allocator);

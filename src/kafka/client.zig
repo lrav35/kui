@@ -75,6 +75,50 @@ pub const KafkaClient = struct {
         }
     }
 
+    pub fn subscribe(self: *KafkaClient, topics: []const []const u8) !void {
+        if (self.client_type != .Consumer) {
+            return KafkaError.ConsumerError;
+        }
+
+        const topic_list = c.rd_kafka_topic_partition_list_new(@intCast(topics.len));
+        defer c.rd_kafka_topic_partition_list_destroy(topic_list);
+
+        for (topics) |topic| {
+            _ = c.rd_kafka_topic_partition_list_add(topic_list, topic.ptr, -1);
+        }
+
+        const err = c.rd_kafka_subscribe(self.kafka_handle.?, topic_list);
+        if (err != c.RD_KAFKA_RESP_ERR_NO_ERROR) {
+            return KafkaError.SubscriptionError;
+        }
+    }
+
+    pub fn consumeMessage(self: *KafkaClient, timeout_ms: i32) !?[]const u8 {
+        if (self.client_type != .Consumer) {
+            return KafkaError.ConsumerError;
+        }
+
+        const message = c.rd_kafka_consumer_poll(self.kafka_handle.?, timeout_ms);
+        if (message == null) {
+            return null;
+        }
+        defer c.rd_kafka_message_destroy(message);
+
+        if (message.*.err != c.RD_KAFKA_RESP_ERR_NO_ERROR) {
+            std.debug.print("Consumer error: {s}\n", .{c.rd_kafka_err2str(message.*.err)});
+            return null;
+        }
+
+        const payload = message.*.payload;
+        const len = message.*.len;
+
+        if (payload == null) {
+            return null;
+        }
+
+        return @as([*]const u8, @ptrCast(payload))[0..len];
+    }
+
     // Get metadata for all topics
     pub fn getMetadata(self: *KafkaClient, timeout_ms: i32) !void {
         var metadata: ?*c.rd_kafka_metadata_t = null;
