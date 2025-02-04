@@ -140,6 +140,7 @@ const Model = struct {
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
     var consumer = try kafka.KafkaClient.init(.Consumer, "my-group-id");
     defer consumer.deinit();
@@ -156,8 +157,25 @@ pub fn main() !void {
 
     // Consume messages in a loop
     while (true) {
-        if (try consumer.consumeMessage(1000)) |msg| {
-            std.debug.print("Received message: {s}\n", .{msg});
+        if (try consumer.consumeMessage(allocator, 1000)) |msg| {
+            defer msg.deinit();
+            std.debug.print(
+                \\Message Details:
+                \\  Topic: {s}
+                \\  Partition: {d}
+                \\  Offset: {d}
+                \\  Timestamp: {s}
+                \\  Key: {?s}
+                \\  Payload: {?s}
+                \\
+            , .{
+                msg.topic,
+                msg.partition,
+                msg.offset,
+                msg.timestamp,
+                msg.key,
+                msg.payload,
+            });
         }
     }
 

@@ -3,6 +3,27 @@ const c = @cImport({
     @cInclude("librdkafka/rdkafka.h");
 });
 
+pub const TimestampType = enum {
+    CREATE,
+    LOG_APPEND,
+    N_A,
+};
+
+pub const KafkaMessage = struct {
+    payload: ?[]const u8,
+    key: ?[]const u8,
+    topic: []const u8,
+    partition: i32,
+    offset: i64,
+    timestamp: []u8,
+    timestampType: TimestampType,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *const KafkaMessage) void {
+        self.allocator.free(self.timestamp);
+    }
+};
+
 pub const KafkaError = error{
     ConfigError,
     ClientCreationError,
@@ -93,7 +114,46 @@ pub const KafkaClient = struct {
         }
     }
 
-    pub fn consumeMessage(self: *KafkaClient, timeout_ms: i32) !?[]const u8 {
+    fn formatTimestamp(timestamp: i64, buffer: []u8) ![]const u8 {
+        // std.debug.print("Raw Kafka timestamp: {d}\n", .{timestamp});
+
+        const seconds = @divFloor(timestamp, 1000);
+
+        // std.debug.print("Seconds since epoch: {d}\n", .{seconds});
+        const datetime = std.time.epoch.EpochSeconds{ .secs = @intCast(seconds) };
+        const epoch_day = datetime.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const month = month_day.month.numeric();
+        const day_secs = datetime.getDaySeconds();
+        const hours = day_secs.getHoursIntoDay();
+        const minutesInHour = day_secs.getMinutesIntoHour();
+        const secondsInMinute = day_secs.getSecondsIntoMinute();
+
+        // std.debug.print("year: {d}\n", .{year_day.year});
+        //
+        // std.debug.print("month: {d}\n", .{month});
+        //
+        // std.debug.print("day: {d}\n", .{month_day.day_index});
+        //
+        // std.debug.print("hour: {d}\n", .{hours});
+        //
+        // std.debug.print("mins: {d}\n", .{minutesInHour});
+        //
+        // std.debug.print("seconds: {d}\n", .{secondsInMinute});
+
+        // Format as: "YYYY-MM-DD HH:MM:SS"
+        return try std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+            year_day.year,
+            month,
+            month_day.day_index,
+            hours,
+            minutesInHour,
+            secondsInMinute,
+        });
+    }
+
+    pub fn consumeMessage(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) !?KafkaMessage {
         if (self.client_type != .Consumer) {
             return KafkaError.ConsumerError;
         }
@@ -109,14 +169,41 @@ pub const KafkaClient = struct {
             return null;
         }
 
-        const payload = message.*.payload;
-        const len = message.*.len;
+        const topic_handle = message.*.rkt;
+        const topic_name = c.rd_kafka_topic_name(topic_handle);
 
-        if (payload == null) {
-            return null;
-        }
+        var timestamp_type: c.rd_kafka_timestamp_type_t = c.RD_KAFKA_TIMESTAMP_NOT_AVAILABLE;
+        const timestamp = c.rd_kafka_message_timestamp(message, &timestamp_type);
 
-        return @as([*]const u8, @ptrCast(payload))[0..len];
+        const ts_type = switch (timestamp_type) {
+            c.RD_KAFKA_TIMESTAMP_CREATE_TIME => TimestampType.CREATE,
+            c.RD_KAFKA_TIMESTAMP_LOG_APPEND_TIME => TimestampType.LOG_APPEND,
+            else => TimestampType.N_A,
+        };
+
+        var time_buffer: [32]u8 = .{0} ** 32;
+        const formatted_time = try formatTimestamp(timestamp, &time_buffer);
+
+        const timestamp_copy = try allocator.alloc(u8, formatted_time.len);
+        @memcpy(timestamp_copy, formatted_time);
+
+        const msg = KafkaMessage{
+            .payload = if (message.*.payload != null)
+                @as([*]const u8, @ptrCast(message.*.payload))[0..message.*.len]
+            else
+                null,
+            .key = if (message.*.key != null)
+                @as([*]const u8, @ptrCast(message.*.key))[0..message.*.key_len]
+            else
+                null,
+            .topic = std.mem.span(topic_name),
+            .partition = message.*.partition,
+            .offset = message.*.offset,
+            .timestamp = timestamp_copy,
+            .timestampType = ts_type,
+            .allocator = allocator,
+        };
+        return msg;
     }
 
     // Get metadata for all topics
