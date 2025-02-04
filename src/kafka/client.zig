@@ -234,6 +234,59 @@ pub const KafkaClient = struct {
             }
         }
     }
+
+    pub fn getTopics(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) ![]TopicInfo {
+        var metadata: ?*c.rd_kafka_metadata_t = null;
+        defer if (metadata != null) c.rd_kafka_metadata_destroy(metadata);
+
+        const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, // all_topics
+            null, // only_topic
+            &metadata, timeout_ms);
+
+        if (err != 0) return KafkaError.MetadataError;
+        if (metadata == null) return &[_]TopicInfo{};
+
+        if (metadata.?.topic_cnt < 0) return KafkaError.MetadataError;
+        const topic_count = @as(usize, @intCast(metadata.?.topic_cnt));
+
+        // Allocate array for topics
+        const topics = try allocator.alloc(TopicInfo, topic_count);
+        errdefer {
+            for (topics) |*topic| topic.deinit();
+            allocator.free(topics);
+        }
+
+        // Fill topics array
+        for (0..topic_count) |i| {
+            const topic = metadata.?.topics[i];
+            const partition_count = if (topic.partition_cnt >= 0)
+                @as(usize, @intCast(topic.partition_cnt))
+            else
+                0;
+
+            topics[i] = try TopicInfo.init(allocator, std.mem.span(topic.topic), partition_count);
+        }
+
+        return topics;
+    }
+};
+
+pub const TopicInfo = struct {
+    name: []const u8,
+    partition_count: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, name: []const u8, partition_count: usize) !TopicInfo {
+        return TopicInfo{
+            .name = try allocator.dupe(u8, name),
+            .partition_count = partition_count,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *const TopicInfo) void {
+        self.allocator.free(self.name);
+    }
 };
 
 const ConsumerGroupState = struct {
