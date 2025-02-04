@@ -142,7 +142,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var consumer = try kafka.KafkaClient.init(.Consumer, "my-group-id");
+    var consumer = try kafka.KafkaClient.init(allocator, .Consumer, "my-group-id");
     defer consumer.deinit();
 
     std.debug.print("Kafka consumer initialized\n", .{});
@@ -154,6 +154,23 @@ pub fn main() !void {
     const topics = [_][]const u8{"kui-test"};
     try consumer.subscribe(&topics);
     std.debug.print("Subscribed to topics\n", .{});
+
+    // get consumer info
+    const info = try kafka.getConsumerGroupInfo(&consumer, allocator, 5000);
+
+    defer {
+        for (info.groups) |*group| {
+            group.deinit();
+        }
+        allocator.free(info.groups);
+    }
+
+    if (info.state_info) |state| {
+        std.debug.print("Consumer Group State:\n", .{});
+        std.debug.print("  Is Rebalancing: {}\n", .{state.is_rebalancing});
+        std.debug.print("  Last Rebalance Time: {d}\n", .{state.last_rebalance_time});
+        std.debug.print("  Current State: {s}\n", .{state.current_state});
+    }
 
     // Consume messages in a loop
     while (true) {

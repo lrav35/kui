@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("librdkafka/rdkafka.h");
 });
+const Mutex = std.Thread.Mutex;
 
 pub const TimestampType = enum {
     CREATE,
@@ -31,6 +32,7 @@ pub const KafkaError = error{
     SubscriptionError,
     ConsumerError,
     TopicPartitionError,
+    GroupListError,
 };
 
 pub const ClientType = enum {
@@ -41,8 +43,9 @@ pub const ClientType = enum {
 pub const KafkaClient = struct {
     kafka_handle: ?*c.rd_kafka_t,
     client_type: ClientType,
+    group_state: ?*ConsumerGroupState,
 
-    pub fn init(client_type: ClientType, group_id: ?[]const u8) !KafkaClient {
+    pub fn init(allocator: std.mem.Allocator, client_type: ClientType, group_id: ?[]const u8) !KafkaClient {
         // Config
         const conf = c.rd_kafka_conf_new();
         if (conf == null) return KafkaError.ConfigError;
@@ -70,6 +73,8 @@ pub const KafkaClient = struct {
             }
         }
 
+        const group_state = try ConsumerGroupState.init(allocator);
+
         // Create the Kafka handle
         const kafka_type = @as(c_uint, @intCast(switch (client_type) {
             .Producer => c.RD_KAFKA_PRODUCER,
@@ -84,6 +89,7 @@ pub const KafkaClient = struct {
         return KafkaClient{
             .kafka_handle = kafka_handle,
             .client_type = client_type,
+            .group_state = group_state,
         };
     }
 
@@ -93,6 +99,9 @@ pub const KafkaClient = struct {
                 _ = c.rd_kafka_consumer_close(handle);
             }
             _ = c.rd_kafka_destroy(handle);
+        }
+        if (self.group_state) |state| {
+            state.deinit();
         }
     }
 
@@ -115,11 +124,8 @@ pub const KafkaClient = struct {
     }
 
     fn formatTimestamp(timestamp: i64, buffer: []u8) ![]const u8 {
-        // std.debug.print("Raw Kafka timestamp: {d}\n", .{timestamp});
-
         const seconds = @divFloor(timestamp, 1000);
 
-        // std.debug.print("Seconds since epoch: {d}\n", .{seconds});
         const datetime = std.time.epoch.EpochSeconds{ .secs = @intCast(seconds) };
         const epoch_day = datetime.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
@@ -130,19 +136,6 @@ pub const KafkaClient = struct {
         const minutesInHour = day_secs.getMinutesIntoHour();
         const secondsInMinute = day_secs.getSecondsIntoMinute();
 
-        // std.debug.print("year: {d}\n", .{year_day.year});
-        //
-        // std.debug.print("month: {d}\n", .{month});
-        //
-        // std.debug.print("day: {d}\n", .{month_day.day_index});
-        //
-        // std.debug.print("hour: {d}\n", .{hours});
-        //
-        // std.debug.print("mins: {d}\n", .{minutesInHour});
-        //
-        // std.debug.print("seconds: {d}\n", .{secondsInMinute});
-
-        // Format as: "YYYY-MM-DD HH:MM:SS"
         return try std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
             year_day.year,
             month,
@@ -242,3 +235,247 @@ pub const KafkaClient = struct {
         }
     }
 };
+
+const ConsumerGroupState = struct {
+    mutex: Mutex,
+    is_rebalancing: bool,
+    last_rebalance_time: i64,
+    current_state: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) !*ConsumerGroupState {
+        const state = try allocator.create(ConsumerGroupState);
+        state.* = .{
+            .mutex = .{},
+            .is_rebalancing = false,
+            .last_rebalance_time = 0,
+            .current_state = try allocator.dupe(u8, "Unknown"),
+            .allocator = allocator,
+        };
+        return state;
+    }
+
+    pub fn deinit(self: *ConsumerGroupState) void {
+        self.allocator.free(self.current_state);
+        self.allocator.destroy(self);
+    }
+
+    pub fn updateState(self: *ConsumerGroupState, new_state: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.allocator.free(self.current_state);
+        self.current_state = try self.allocator.dupe(u8, new_state);
+    }
+
+    pub fn setRebalancing(self: *ConsumerGroupState, is_rebalancing: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.is_rebalancing = is_rebalancing;
+        self.last_rebalance_time = std.time.timestamp();
+    }
+
+    pub fn getStatus(self: *ConsumerGroupState) GroupStateInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return .{
+            .is_rebalancing = self.is_rebalancing,
+            .last_rebalance_time = self.last_rebalance_time,
+            .current_state = self.current_state,
+        };
+    }
+};
+
+const RebalanceContext = struct {
+    client: *KafkaClient,
+    allocator: std.mem.Allocator,
+};
+
+fn rebalanceCallback(
+    rk: ?*c.rd_kafka_t,
+    err: c.rd_kafka_resp_err_t,
+    partitions: ?*c.rd_kafka_topic_partition_list_t,
+    user_data: ?*anyopaque,
+) callconv(.C) void {
+    const context = @as(*RebalanceContext, @ptrCast(@alignCast(user_data)));
+    const client = context.client;
+
+    if (client.group_state) |state| {
+        switch (err) {
+            c.RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
+                state.setRebalancing(true);
+                state.updateState("Rebalancing - Assigning") catch {};
+                _ = c.rd_kafka_assign(rk, partitions);
+                state.setRebalancing(false);
+                state.updateState("Stable") catch {};
+            },
+            c.RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => {
+                state.setRebalancing(true);
+                state.updateState("Rebalancing - Revoking") catch {};
+                _ = c.rd_kafka_assign(rk, null);
+            },
+            else => {
+                state.updateState("Error") catch {};
+                std.debug.print("Rebalancing failed: {s}\n", .{
+                    c.rd_kafka_err2str(err),
+                });
+            },
+        }
+    }
+}
+
+const GroupMember = struct {
+    member_id: []const u8,
+    client_id: []const u8,
+    client_host: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        member: *allowzero const c.rd_kafka_group_member_info,
+    ) !GroupMember {
+        return GroupMember{
+            .member_id = try allocator.dupe(u8, std.mem.span(member.member_id)),
+            .client_id = try allocator.dupe(u8, std.mem.span(member.client_id)),
+            .client_host = try allocator.dupe(u8, std.mem.span(member.client_host)),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *const GroupMember) void {
+        self.allocator.free(self.member_id);
+        self.allocator.free(self.client_id);
+        self.allocator.free(self.client_host);
+    }
+
+    pub fn format(
+        self: GroupMember,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("Member: {s} (Client: {s}, Host: {s})", .{
+            self.member_id,
+            self.client_id,
+            self.client_host,
+        });
+    }
+};
+
+const GroupInfo = struct {
+    group_id: []const u8,
+    state: []const u8,
+    protocol_type: []const u8,
+    protocol: []const u8,
+    members: []const GroupMember,
+    allocator: std.mem.Allocator,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        group: *allowzero const c.rd_kafka_group_info,
+    ) !GroupInfo {
+        if (group.member_cnt < 0) return KafkaError.GroupListError;
+        const count = @as(usize, @intCast(group.member_cnt));
+        const members = try allocator.alloc(GroupMember, count);
+        errdefer allocator.free(members);
+
+        // Initialize all members
+        for (members, 0..count) |*member, i| {
+            member.* = try GroupMember.init(allocator, &group.members[i]);
+        }
+
+        return GroupInfo{
+            .group_id = try allocator.dupe(u8, std.mem.span(group.group)),
+            .state = try allocator.dupe(u8, std.mem.span(group.state)),
+            .protocol_type = try allocator.dupe(u8, std.mem.span(group.protocol_type)),
+            .protocol = try allocator.dupe(u8, std.mem.span(group.protocol)),
+            .members = members,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *const GroupInfo) void {
+        for (self.members) |member| {
+            member.deinit();
+        }
+        self.allocator.free(self.members);
+        self.allocator.free(self.group_id);
+        self.allocator.free(self.state);
+        self.allocator.free(self.protocol_type);
+        self.allocator.free(self.protocol);
+    }
+
+    pub fn format(
+        self: GroupInfo,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("Group: {s}\n", .{self.group_id});
+        try writer.print("  State: {s}\n", .{self.state});
+        try writer.print("  Protocol Type: {s}\n", .{self.protocol_type});
+        try writer.print("  Protocol: {s}\n", .{self.protocol});
+        try writer.print("  Members ({d}):\n", .{self.members.len});
+        for (self.members) |member| {
+            try writer.print("    {}\n", .{member});
+        }
+    }
+};
+
+pub const GroupStateInfo = struct {
+    is_rebalancing: bool,
+    last_rebalance_time: i64,
+    current_state: []const u8,
+};
+
+pub fn getConsumerGroupInfo(client: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) !struct {
+    groups: []GroupInfo,
+    state_info: ?GroupStateInfo,
+} {
+    // Get group info
+    const groups = try getGroupInfo(client, allocator, timeout_ms);
+    defer {
+        for (groups) |*group| group.deinit();
+        allocator.free(groups);
+    }
+
+    const state_info = if (client.group_state) |state|
+        state.getStatus()
+    else
+        null;
+
+    return .{
+        .groups = groups,
+        .state_info = state_info,
+    };
+}
+
+pub fn getGroupInfo(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) ![]GroupInfo {
+    var list: ?*c.rd_kafka_group_list = null;
+    errdefer if (list) |l| c.rd_kafka_group_list_destroy(l);
+
+    const err = c.rd_kafka_list_groups(self.kafka_handle, null, &list, timeout_ms);
+    if (err != 0) return KafkaError.GroupListError;
+    if (list == null) return &[_]GroupInfo{};
+
+    if (list.?.group_cnt < 0) return KafkaError.GroupListError;
+    const count = @as(usize, @intCast(list.?.group_cnt));
+
+    const groups = try allocator.alloc(GroupInfo, count);
+    errdefer {
+        for (groups) |*group| group.deinit();
+        allocator.free(groups);
+    }
+
+    for (groups, 0..count) |*group, i| {
+        group.* = try GroupInfo.init(allocator, &list.?.groups[i]);
+    }
+
+    return groups;
+}
