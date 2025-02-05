@@ -13,11 +13,18 @@ const Model = struct {
     consumer_state: ?kafka.GroupStateInfo,
     selected_topic: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, topics: [][]const u8, state: ?kafka.GroupStateInfo) !*Model {
+    pub fn init(allocator: std.mem.Allocator, topics: []kafka.TopicInfo, state: ?kafka.GroupStateInfo) !*Model {
         const model = try allocator.create(Model);
+        errdefer allocator.destroy(model);
+        const topic_names = try allocator.alloc([]const u8, topics.len);
+        errdefer allocator.free(topic_names);
+        for (topics, 0..) |topic, i| {
+            topic_names[i] = try allocator.dupe(u8, topic.name);
+        }
+
         model.* = .{
             .allocator = allocator,
-            .topics = try allocator.dupe([]const u8, topics),
+            .topics = topic_names,
             .consumer_state = state,
         };
         return model;
@@ -143,19 +150,14 @@ pub fn main() !void {
 
     const topics = try consumer.getTopics(allocator, 5000);
     defer {
-        for (topics) |*topic| topic.deinit();
+        for (topics) |*topic| {
+            topic.deinit();
+        }
         allocator.free(topics);
     }
 
-    const names = try allocator.alloc([]const u8, topics.len);
-    defer allocator.free(names);
-
-    for (topics, names) |topic, *name| {
-        name.* = topic.name;
-    }
-
     // Get metadata
-    try consumer.getMetadata(5000);
+    // try consumer.getMetadata(5000);
     const info = try kafka.getConsumerGroupInfo(&consumer, allocator, 5000);
     defer {
         for (info.groups) |*group| {
@@ -167,7 +169,7 @@ pub fn main() !void {
     var app = try vxfw.App.init(allocator);
     defer app.deinit();
 
-    const model = try Model.init(allocator, names, info.state_info);
+    const model = try Model.init(allocator, topics, info.state_info);
     defer model.deinit();
 
     try app.run(model.widget(), .{});
