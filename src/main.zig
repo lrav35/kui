@@ -6,37 +6,42 @@ const c = @cImport({
     @cInclude("librdkafka/rdkafka.h");
 });
 
-/// Our main application state
 const Model = struct {
     allocator: std.mem.Allocator,
-    topics: [][]const u8,
+    topics: []kafka.TopicData,
     consumer_state: ?kafka.GroupStateInfo,
     selected_topic: usize = 0,
+    should_exit: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, topics: []kafka.TopicInfo, state: ?kafka.GroupStateInfo) !*Model {
         const model = try allocator.create(Model);
         errdefer allocator.destroy(model);
-        const topic_names = try allocator.alloc([]const u8, topics.len);
-        errdefer allocator.free(topic_names);
+
+        const topic_data = try allocator.alloc(kafka.TopicData, topics.len);
+        errdefer allocator.free(topic_data);
+
         for (topics, 0..) |topic, i| {
-            topic_names[i] = try allocator.dupe(u8, topic.name);
+            topic_data[i] = try kafka.TopicData.init(allocator, topic.name);
         }
 
         model.* = .{
             .allocator = allocator,
-            .topics = topic_names,
+            .topics = topic_data,
             .consumer_state = state,
+            .should_exit = std.atomic.Value(bool).init(false),
         };
         return model;
     }
 
     pub fn deinit(self: *Model) void {
         if (self.topics.len > 0) {
-            for (self.topics) |topic| {
-                self.allocator.free(topic);
+            for (self.topics) |*topic| {
+                topic.deinit();
             }
             self.allocator.free(self.topics);
         }
+
+        self.should_exit.store(true, .seq_cst);
         self.allocator.destroy(self);
     }
 
@@ -53,6 +58,7 @@ const Model = struct {
         switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) {
+                    self.should_exit.store(true, .seq_cst);
                     ctx.quit = true;
                     return;
                 }
@@ -88,12 +94,17 @@ const Model = struct {
             .{ .width = max_size.width, .height = 1 },
         ));
 
+        // Calculate layout dimensions
+        const topic_list_width = @min(30, max_size.width / 3); // Adjust these values as needed
+        const messages_width = max_size.width - topic_list_width - 1; // -1 for separator
+        const content_height = max_size.height - 4; // Space for header and state info
+
         // Create topic list text
         var topic_text = std.ArrayList(u8).init(ctx.arena);
         for (self.topics, 0..) |topic, i| {
             const prefix = if (i == self.selected_topic) "> " else "  ";
             try topic_text.appendSlice(prefix);
-            try topic_text.appendSlice(topic);
+            try topic_text.appendSlice(topic.name);
             try topic_text.append('\n');
         }
 
@@ -105,7 +116,49 @@ const Model = struct {
 
         const topics_surf = try topics_list.draw(ctx.withConstraints(
             .{},
-            .{ .width = max_size.width, .height = max_size.height - 4 },
+            .{ .width = topic_list_width, .height = content_height },
+        ));
+
+        // Create messages text for selected topic
+        var messages_text = std.ArrayList(u8).init(ctx.arena);
+        if (self.topics.len > 0) {
+            const selected_topic = &self.topics[self.selected_topic];
+            try std.fmt.format(messages_text.writer(), "Messages for {s}:\n\n", .{selected_topic.name});
+
+            for (selected_topic.messages.items) |msg| {
+                try std.fmt.format(messages_text.writer(),
+                    \\Offset: {d}
+                    \\Key: {?s}
+                    \\Payload: {?s}
+                    \\-------------------
+                    \\
+                , .{ msg.offset, msg.key, msg.payload });
+            }
+        }
+
+        const messages_list = vxfw.RichText{
+            .text = &.{
+                .{ .text = messages_text.items },
+            },
+        };
+
+        const messages_surf = try messages_list.draw(ctx.withConstraints(
+            .{},
+            .{ .width = messages_width, .height = content_height },
+        ));
+
+        // Create vertical separator
+        var separator = std.ArrayList(u8).init(ctx.arena);
+        var i: usize = 0;
+        while (i < content_height) : (i += 1) {
+            try separator.appendSlice("│");
+            try separator.append('\n');
+        }
+
+        const separator_text = vxfw.Text{ .text = separator.items };
+        const separator_surf = try separator_text.draw(ctx.withConstraints(
+            .{},
+            .{ .width = 1, .height = content_height },
         ));
 
         // Create state info text
@@ -125,11 +178,13 @@ const Model = struct {
             .{ .width = max_size.width, .height = 4 },
         ));
 
-        // Create layout
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
+        // Create layout with all components
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 5);
         children[0] = .{ .surface = header_surf, .origin = .{ .row = 0, .col = 0 } };
         children[1] = .{ .surface = topics_surf, .origin = .{ .row = 2, .col = 0 } };
-        children[2] = .{ .surface = state_surf, .origin = .{ .row = max_size.height - 4, .col = 0 } };
+        children[2] = .{ .surface = separator_surf, .origin = .{ .row = 2, .col = topic_list_width } };
+        children[3] = .{ .surface = messages_surf, .origin = .{ .row = 2, .col = topic_list_width + 1 } };
+        children[4] = .{ .surface = state_surf, .origin = .{ .row = max_size.height - 4, .col = 0 } };
 
         return .{
             .size = max_size,
@@ -140,6 +195,26 @@ const Model = struct {
     }
 };
 
+fn fetchMessages(consumer: *kafka.KafkaClient, model: *Model) !void {
+    std.debug.print("Starting message fetch loop\n", .{});
+    while (!model.should_exit.load(.seq_cst)) {
+        if (try consumer.consumeMessage(model.allocator, 100)) |msg| {
+            std.debug.print("Received message for topic: {s}\n", .{msg.topic});
+            for (model.topics) |*topic| {
+                if (std.mem.eql(u8, topic.name, msg.topic)) {
+                    try topic.messages.append(msg);
+                    std.debug.print("Added message to topic {s}, total messages: {d}\n", .{
+                        topic.name,
+                        topic.messages.items.len,
+                    });
+                    break;
+                }
+            }
+        }
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -148,6 +223,7 @@ pub fn main() !void {
     var consumer = try kafka.KafkaClient.init(allocator, .Consumer, "my-group-id");
     defer consumer.deinit();
 
+    std.debug.print("Getting topics\n", .{});
     const topics = try consumer.getTopics(allocator, 5000);
     defer {
         for (topics) |*topic| {
@@ -155,6 +231,15 @@ pub fn main() !void {
         }
         allocator.free(topics);
     }
+
+    std.debug.print("Available topics:\n", .{});
+    for (topics) |topic| {
+        std.debug.print("Topic: {s}, Partitions: {d}\n", .{ topic.name, topic.partition_count });
+    }
+
+    std.debug.print("subscribing to topics\n", .{});
+    try consumer.subscribe(topics);
+    std.debug.print("subscribed to topics\n", .{});
 
     // Get metadata
     // try consumer.getMetadata(5000);
@@ -172,37 +257,12 @@ pub fn main() !void {
     const model = try Model.init(allocator, topics, info.state_info);
     defer model.deinit();
 
+    std.debug.print("fetching messages\n", .{});
+
+    var thread = try std.Thread.spawn(.{}, fetchMessages, .{ &consumer, model });
+    defer thread.join();
+
+    std.debug.print("got messages!\n", .{});
+
     try app.run(model.widget(), .{});
-
-    // if (info.state_info) |state| {
-    //     std.debug.print("Consumer Group State:\n", .{});
-    //     std.debug.print("  Is Rebalancing: {}\n", .{state.is_rebalancing});
-    //     std.debug.print("  Last Rebalance Time: {d}\n", .{state.last_rebalance_time});
-    //     std.debug.print("  Current State: {s}\n", .{state.current_state});
-    // }
-    //
-    // // Consume messages in a loop
-    // while (true) {
-    //     if (try consumer.consumeMessage(allocator, 1000)) |msg| {
-    //         defer msg.deinit();
-    //         std.debug.print(
-    //             \\Message Details:
-    //             \\  Topic: {s}
-    //             \\  Partition: {d}
-    //             \\  Offset: {d}
-    //             \\  Timestamp: {s}
-    //             \\  Key: {?s}
-    //             \\  Payload: {?s}
-    //             \\
-    //         , .{
-    //             msg.topic,
-    //             msg.partition,
-    //             msg.offset,
-    //             msg.timestamp,
-    //             msg.key,
-    //             msg.payload,
-    //         });
-    //     }
-    // }
-
 }

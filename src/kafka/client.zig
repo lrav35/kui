@@ -106,7 +106,7 @@ pub const KafkaClient = struct {
         }
     }
 
-    pub fn subscribe(self: *KafkaClient, topics: []const []const u8) !void {
+    pub fn subscribe(self: *KafkaClient, topics: []TopicInfo) !void {
         if (self.client_type != .Consumer) {
             return KafkaError.ConsumerError;
         }
@@ -114,8 +114,9 @@ pub const KafkaClient = struct {
         const topic_list = c.rd_kafka_topic_partition_list_new(@intCast(topics.len));
         defer c.rd_kafka_topic_partition_list_destroy(topic_list);
 
-        for (topics) |topic| {
-            _ = c.rd_kafka_topic_partition_list_add(topic_list, topic.ptr, -1);
+        for (topics) |*topic| {
+            std.debug.print("topic name I am subscribing to: {s} \n", .{topic.name});
+            _ = c.rd_kafka_topic_partition_list_add(topic_list, topic.name.ptr, -1);
         }
 
         const err = c.rd_kafka_subscribe(self.kafka_handle.?, topic_list);
@@ -237,46 +238,67 @@ pub const KafkaClient = struct {
     }
 
     pub fn getTopics(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) ![]TopicInfo {
+        std.debug.print("Starting getTopics\n", .{});
         var metadata: ?*c.rd_kafka_metadata_t = null;
         defer if (metadata != null) c.rd_kafka_metadata_destroy(metadata);
 
         const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, null, &metadata, timeout_ms);
 
+        std.debug.print("About to call rd_kafka_metadata\n", .{});
         if (err != 0) return KafkaError.MetadataError;
         if (metadata == null) return &[_]TopicInfo{};
-
         if (metadata.?.topic_cnt < 0) return KafkaError.MetadataError;
-        const topic_count = @as(usize, @intCast(metadata.?.topic_cnt));
 
-        // Allocate array for topics
-        const topics = try allocator.alloc(TopicInfo, topic_count);
-        errdefer allocator.free(topics);
+        std.debug.print("Found {d} topics\n", .{metadata.?.topic_cnt});
+        var topics = std.ArrayList(TopicInfo).init(allocator);
+        defer topics.deinit();
 
-        var initialized_count: usize = 0;
         errdefer {
-            // Only deinit the successfully initialized topics
-            for (topics[0..initialized_count]) |*topic| {
+            for (topics.items) |*topic| {
                 topic.deinit();
             }
         }
 
-        // Fill topics array
-        for (0..topic_count) |i| {
+        const total_topics = @as(usize, @intCast(metadata.?.topic_cnt));
+        try topics.ensureTotalCapacity(total_topics);
+
+        for (0..total_topics) |i| {
             const topic = metadata.?.topics[i];
-            if (topic.topic == null) continue;
+            // Use optional chaining to make null check more concise
+            const topic_name = if (topic.topic) |name| std.mem.span(name) else continue;
 
-            const partition_count = if (topic.partition_cnt >= 0)
-                @as(usize, @intCast(topic.partition_cnt))
-            else
-                0;
+            // Skip internal topics
+            if (std.mem.startsWith(u8, topic_name, "__")) continue;
 
-            // Ensure topic.topic is valid before creating span
-            const topic_name = std.mem.span(topic.topic);
-            topics[i] = try TopicInfo.init(allocator, topic_name, partition_count);
-            initialized_count += 1;
+            const partition_count = @max(0, topic.partition_cnt);
+            const topic_info = try TopicInfo.init(allocator, topic_name, @intCast(partition_count));
+            try topics.append(topic_info);
         }
 
-        return topics;
+        std.debug.print("Finished processing topics\n", .{});
+        return topics.toOwnedSlice();
+    }
+};
+
+pub const TopicData = struct {
+    name: []const u8,
+    messages: std.ArrayList(KafkaMessage),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, name: []const u8) !TopicData {
+        return TopicData{
+            .name = try allocator.dupe(u8, name),
+            .messages = std.ArrayList(KafkaMessage).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *TopicData) void {
+        for (self.messages.items) |*msg| {
+            msg.deinit();
+        }
+        self.messages.deinit();
+        self.allocator.free(self.name);
     }
 };
 
