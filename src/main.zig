@@ -196,17 +196,11 @@ const Model = struct {
 };
 
 fn fetchMessages(consumer: *kafka.KafkaClient, model: *Model) !void {
-    std.debug.print("Starting message fetch loop\n", .{});
     while (!model.should_exit.load(.seq_cst)) {
         if (try consumer.consumeMessage(model.allocator, 100)) |msg| {
-            std.debug.print("Received message for topic: {s}\n", .{msg.topic});
             for (model.topics) |*topic| {
                 if (std.mem.eql(u8, topic.name, msg.topic)) {
                     try topic.messages.append(msg);
-                    std.debug.print("Added message to topic {s}, total messages: {d}\n", .{
-                        topic.name,
-                        topic.messages.items.len,
-                    });
                     break;
                 }
             }
@@ -223,7 +217,6 @@ pub fn main() !void {
     var consumer = try kafka.KafkaClient.init(allocator, .Consumer, "my-group-id");
     defer consumer.deinit();
 
-    std.debug.print("Getting topics\n", .{});
     const topics = try consumer.getTopics(allocator, 5000);
     defer {
         for (topics) |*topic| {
@@ -232,14 +225,7 @@ pub fn main() !void {
         allocator.free(topics);
     }
 
-    std.debug.print("Available topics:\n", .{});
-    for (topics) |topic| {
-        std.debug.print("Topic: {s}, Partitions: {d}\n", .{ topic.name, topic.partition_count });
-    }
-
-    std.debug.print("subscribing to topics\n", .{});
     try consumer.subscribe(topics);
-    std.debug.print("subscribed to topics\n", .{});
 
     // Get metadata
     // try consumer.getMetadata(5000);
@@ -257,12 +243,8 @@ pub fn main() !void {
     const model = try Model.init(allocator, topics, info.state_info);
     defer model.deinit();
 
-    std.debug.print("fetching messages\n", .{});
-
     var thread = try std.Thread.spawn(.{}, fetchMessages, .{ &consumer, model });
     defer thread.join();
-
-    std.debug.print("got messages!\n", .{});
 
     try app.run(model.widget(), .{});
 }

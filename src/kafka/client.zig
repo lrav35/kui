@@ -34,6 +34,7 @@ pub const KafkaError = error{
     TopicPartitionError,
     GroupListError,
     InvalidName,
+    TopicNameTooLong,
 };
 
 pub const ClientType = enum {
@@ -115,13 +116,18 @@ pub const KafkaClient = struct {
         defer c.rd_kafka_topic_partition_list_destroy(topic_list);
 
         for (topics) |*topic| {
-            std.debug.print("topic name I am subscribing to: {s} \n", .{topic.name});
             _ = c.rd_kafka_topic_partition_list_add(topic_list, topic.name.ptr, -1);
         }
 
         const err = c.rd_kafka_subscribe(self.kafka_handle.?, topic_list);
         if (err != c.RD_KAFKA_RESP_ERR_NO_ERROR) {
             return KafkaError.SubscriptionError;
+        }
+
+        var subscription: ?*c.rd_kafka_topic_partition_list_t = null;
+        const metadata_result = c.rd_kafka_subscription(self.kafka_handle, &subscription);
+        if (metadata_result == c.RD_KAFKA_RESP_ERR_NO_ERROR) {
+            defer c.rd_kafka_topic_partition_list_destroy(subscription);
         }
     }
 
@@ -161,6 +167,10 @@ pub const KafkaClient = struct {
 
         if (message.*.err != c.RD_KAFKA_RESP_ERR_NO_ERROR) {
             std.debug.print("Consumer error: {s}\n", .{c.rd_kafka_err2str(message.*.err)});
+            if (message.*.rkt != null) {
+                const topic_name = c.rd_kafka_topic_name(message.*.rkt);
+                std.debug.print("Failed topic: {s}\n", .{topic_name});
+            }
             return null;
         }
 
@@ -213,43 +223,18 @@ pub const KafkaClient = struct {
         }
 
         defer c.rd_kafka_metadata_destroy(metadata);
-
-        // // Print metadata information
-        // if (metadata) |md| {
-        //     std.debug.print("Metadata for {d} brokers:\n", .{md.broker_cnt});
-        //
-        //     var i: usize = 0;
-        //     while (i < md.broker_cnt) : (i += 1) {
-        //         const broker = md.brokers[i];
-        //         std.debug.print("  Broker {d}: {s}:{d}\n", .{
-        //             broker.id,
-        //             broker.host,
-        //             broker.port,
-        //         });
-        //     }
-        //
-        //     std.debug.print("\nMetadata for {d} topics:\n", .{md.topic_cnt});
-        //     i = 0;
-        //     while (i < md.topic_cnt) : (i += 1) {
-        //         const topic = md.topics[i];
-        //         std.debug.print("  Topic: {s}\n", .{topic.topic});
-        //     }
-        // }
     }
 
     pub fn getTopics(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) ![]TopicInfo {
-        std.debug.print("Starting getTopics\n", .{});
         var metadata: ?*c.rd_kafka_metadata_t = null;
         defer if (metadata != null) c.rd_kafka_metadata_destroy(metadata);
 
         const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, null, &metadata, timeout_ms);
 
-        std.debug.print("About to call rd_kafka_metadata\n", .{});
         if (err != 0) return KafkaError.MetadataError;
         if (metadata == null) return &[_]TopicInfo{};
         if (metadata.?.topic_cnt < 0) return KafkaError.MetadataError;
 
-        std.debug.print("Found {d} topics\n", .{metadata.?.topic_cnt});
         var topics = std.ArrayList(TopicInfo).init(allocator);
         defer topics.deinit();
 
@@ -275,7 +260,6 @@ pub const KafkaClient = struct {
             try topics.append(topic_info);
         }
 
-        std.debug.print("Finished processing topics\n", .{});
         return topics.toOwnedSlice();
     }
 };
@@ -303,13 +287,14 @@ pub const TopicData = struct {
 };
 
 pub const TopicInfo = struct {
-    name: []const u8,
+    name: [:0]const u8,
     partition_count: usize,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, partition_count: usize) !TopicInfo {
         if (name.len == 0) return error.InvalidName;
-        const name_copy = try allocator.dupe(u8, name);
+        if (name.len >= 255) return error.TopicNameTooLong;
+        const name_copy = try allocator.dupeZ(u8, name);
         return TopicInfo{
             .name = name_copy,
             .partition_count = partition_count,
