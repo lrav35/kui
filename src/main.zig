@@ -14,9 +14,6 @@ const Model = struct {
     should_exit: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, topics: []kafka.TopicInfo, state: ?kafka.GroupStateInfo) !*Model {
-        const model = try allocator.create(Model);
-        errdefer allocator.destroy(model);
-
         const topic_data = try allocator.alloc(kafka.TopicData, topics.len);
         errdefer allocator.free(topic_data);
 
@@ -24,24 +21,26 @@ const Model = struct {
             topic_data[i] = try kafka.TopicData.init(allocator, topic.name);
         }
 
+        const model = try allocator.create(Model);
+        errdefer allocator.destroy(model);
+        
         model.* = .{
             .allocator = allocator,
             .topics = topic_data,
             .consumer_state = state,
             .should_exit = std.atomic.Value(bool).init(false),
         };
+        
         return model;
     }
 
     pub fn deinit(self: *Model) void {
-        if (self.topics.len > 0) {
-            for (self.topics) |*topic| {
-                topic.deinit();
-            }
-            self.allocator.free(self.topics);
+        for (self.topics) |*topic| {
+            topic.deinit();
         }
+        self.allocator.free(self.topics);
 
-        self.should_exit.store(true, .seq_cst);
+        self.should_exit.store(true, .release);
         self.allocator.destroy(self);
     }
 
@@ -58,23 +57,20 @@ const Model = struct {
         switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) {
-                    self.should_exit.store(true, .seq_cst);
+                    self.should_exit.store(true, .release);
                     ctx.quit = true;
                     return;
                 }
-                if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                    if (self.topics.len > 0) {
+                
+                if (self.topics.len > 0) {
+                    if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
                         self.selected_topic = (self.selected_topic + 1) % self.topics.len;
                         ctx.redraw = true;
-                    }
-                }
-                if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                    if (self.topics.len > 0) {
-                        if (self.selected_topic == 0) {
-                            self.selected_topic = self.topics.len - 1;
-                        } else {
-                            self.selected_topic -= 1;
-                        }
+                    } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                        self.selected_topic = if (self.selected_topic == 0)
+                            self.topics.len - 1
+                        else
+                            self.selected_topic - 1;
                         ctx.redraw = true;
                     }
                 }
@@ -149,12 +145,10 @@ const Model = struct {
 
         // Create vertical separator
         var separator = std.ArrayList(u8).init(ctx.arena);
-        var i: usize = 0;
-        while (i < content_height) : (i += 1) {
-            try separator.appendSlice("│");
-            try separator.append('\n');
+        for (0..content_height) |_| {
+            try separator.appendSlice("│\n");
         }
-
+        
         const separator_text = vxfw.Text{ .text = separator.items };
         const separator_surf = try separator_text.draw(ctx.withConstraints(
             .{},
@@ -196,7 +190,7 @@ const Model = struct {
 };
 
 fn fetchMessages(consumer: *kafka.KafkaClient, model: *Model) !void {
-    while (!model.should_exit.load(.seq_cst)) {
+    while (!model.should_exit.load(.acquire)) {
         if (try consumer.consumeMessage(model.allocator, 100)) |msg| {
             for (model.topics) |*topic| {
                 if (std.mem.eql(u8, topic.name, msg.topic)) {
@@ -219,21 +213,15 @@ pub fn main() !void {
 
     const topics = try consumer.getTopics(allocator, 5000);
     defer {
-        for (topics) |*topic| {
-            topic.deinit();
-        }
+        for (topics) |*topic| topic.deinit();
         allocator.free(topics);
     }
 
     try consumer.subscribe(topics);
 
-    // Get metadata
-    // try consumer.getMetadata(5000);
     const info = try kafka.getConsumerGroupInfo(&consumer, allocator, 5000);
     defer {
-        for (info.groups) |*group| {
-            group.deinit();
-        }
+        for (info.groups) |*group| group.deinit();
         allocator.free(info.groups);
     }
 

@@ -47,6 +47,13 @@ pub const KafkaClient = struct {
     client_type: ClientType,
     group_state: ?*ConsumerGroupState,
 
+    fn setConfig(conf: ?*c.rd_kafka_conf_t, key: [*:0]const u8, value: [*:0]const u8, errstr: *[512]u8) !void {
+        if (c.rd_kafka_conf_set(conf, key, value, errstr, errstr.len) != c.RD_KAFKA_CONF_OK) {
+            c.rd_kafka_conf_destroy(conf);
+            return KafkaError.ConfigError;
+        }
+    }
+
     pub fn init(allocator: std.mem.Allocator, client_type: ClientType, group_id: ?[]const u8) !KafkaClient {
         // Config
         const conf = c.rd_kafka_conf_new();
@@ -54,25 +61,17 @@ pub const KafkaClient = struct {
 
         // Configure the bootstrap servers
         var errstr: [512]u8 = [_]u8{0} ** 512;
-        const bootstrap_servers = "localhost:9092";
-        if (c.rd_kafka_conf_set(conf, "bootstrap.servers", bootstrap_servers, &errstr, errstr.len) != c.RD_KAFKA_CONF_OK) {
-            c.rd_kafka_conf_destroy(conf);
-            return KafkaError.ConfigError;
-        }
+        try setConfig(conf, "bootstrap.servers", "localhost:9092", &errstr);
 
-        // If it's a consumer, set the group.id
+        // If it's a consumer, set the group.id and auto.offset.reset
         if (client_type == .Consumer) {
             if (group_id) |id| {
-                if (c.rd_kafka_conf_set(conf, "group.id", id.ptr, &errstr, errstr.len) != c.RD_KAFKA_CONF_OK) {
-                    c.rd_kafka_conf_destroy(conf);
-                    return KafkaError.ConfigError;
-                }
+                // Need to convert to null-terminated string
+                const id_z = try allocator.dupeZ(u8, id);
+                defer allocator.free(id_z);
+                try setConfig(conf, "group.id", id_z, &errstr);
             }
-            // Set auto.offset.reset to "earliest"
-            if (c.rd_kafka_conf_set(conf, "auto.offset.reset", "earliest", &errstr, errstr.len) != c.RD_KAFKA_CONF_OK) {
-                c.rd_kafka_conf_destroy(conf);
-                return KafkaError.ConfigError;
-            }
+            try setConfig(conf, "auto.offset.reset", "earliest", &errstr);
         }
 
         const group_state = try ConsumerGroupState.init(allocator);
@@ -133,24 +132,19 @@ pub const KafkaClient = struct {
 
     fn formatTimestamp(timestamp: i64, buffer: []u8) ![]const u8 {
         const seconds = @divFloor(timestamp, 1000);
-
-        const datetime = std.time.epoch.EpochSeconds{ .secs = @intCast(seconds) };
-        const epoch_day = datetime.getEpochDay();
+        const ts = std.time.epoch.EpochSeconds{ .secs = @intCast(seconds) };
+        const epoch_day = ts.getEpochDay();
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
-        const month = month_day.month.numeric();
-        const day_secs = datetime.getDaySeconds();
-        const hours = day_secs.getHoursIntoDay();
-        const minutesInHour = day_secs.getMinutesIntoHour();
-        const secondsInMinute = day_secs.getSecondsIntoMinute();
-
+        const day_secs = ts.getDaySeconds();
+        
         return try std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
             year_day.year,
-            month,
+            @as(u8, @intCast(month_day.month.numeric())),
             month_day.day_index,
-            hours,
-            minutesInHour,
-            secondsInMinute,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
         });
     }
 
@@ -168,14 +162,12 @@ pub const KafkaClient = struct {
         if (message.*.err != c.RD_KAFKA_RESP_ERR_NO_ERROR) {
             std.debug.print("Consumer error: {s}\n", .{c.rd_kafka_err2str(message.*.err)});
             if (message.*.rkt != null) {
-                const topic_name = c.rd_kafka_topic_name(message.*.rkt);
-                std.debug.print("Failed topic: {s}\n", .{topic_name});
+                std.debug.print("Failed topic: {s}\n", .{c.rd_kafka_topic_name(message.*.rkt)});
             }
             return null;
         }
 
-        const topic_handle = message.*.rkt;
-        const topic_name = c.rd_kafka_topic_name(topic_handle);
+        const topic_name = c.rd_kafka_topic_name(message.*.rkt);
 
         var timestamp_type: c.rd_kafka_timestamp_type_t = c.RD_KAFKA_TIMESTAMP_NOT_AVAILABLE;
         const timestamp = c.rd_kafka_message_timestamp(message, &timestamp_type);
@@ -188,11 +180,9 @@ pub const KafkaClient = struct {
 
         var time_buffer: [32]u8 = .{0} ** 32;
         const formatted_time = try formatTimestamp(timestamp, &time_buffer);
+        const timestamp_copy = try allocator.dupe(u8, formatted_time);
 
-        const timestamp_copy = try allocator.alloc(u8, formatted_time.len);
-        @memcpy(timestamp_copy, formatted_time);
-
-        const msg = KafkaMessage{
+        return KafkaMessage{
             .payload = if (message.*.payload != null)
                 @as([*]const u8, @ptrCast(message.*.payload))[0..message.*.len]
             else
@@ -208,7 +198,6 @@ pub const KafkaClient = struct {
             .timestampType = ts_type,
             .allocator = allocator,
         };
-        return msg;
     }
 
     // Get metadata for all topics
@@ -232,32 +221,29 @@ pub const KafkaClient = struct {
         const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, null, &metadata, timeout_ms);
 
         if (err != 0) return KafkaError.MetadataError;
-        if (metadata == null) return &[_]TopicInfo{};
-        if (metadata.?.topic_cnt < 0) return KafkaError.MetadataError;
+        if (metadata == null or metadata.?.topic_cnt < 0) return &[_]TopicInfo{};
 
         var topics = std.ArrayList(TopicInfo).init(allocator);
         defer topics.deinit();
 
-        errdefer {
-            for (topics.items) |*topic| {
-                topic.deinit();
-            }
-        }
+        errdefer for (topics.items) |*topic| topic.deinit();
 
         const total_topics = @as(usize, @intCast(metadata.?.topic_cnt));
         try topics.ensureTotalCapacity(total_topics);
 
         for (0..total_topics) |i| {
             const topic = metadata.?.topics[i];
-            // Use optional chaining to make null check more concise
             const topic_name = if (topic.topic) |name| std.mem.span(name) else continue;
 
             // Skip internal topics
             if (std.mem.startsWith(u8, topic_name, "__")) continue;
 
             const partition_count = @max(0, topic.partition_cnt);
-            const topic_info = try TopicInfo.init(allocator, topic_name, @intCast(partition_count));
-            try topics.append(topic_info);
+            try topics.append(try TopicInfo.init(
+                allocator, 
+                topic_name, 
+                @intCast(partition_count)
+            ));
         }
 
         return topics.toOwnedSlice();
@@ -450,13 +436,14 @@ const GroupInfo = struct {
         group: *allowzero const c.rd_kafka_group_info,
     ) !GroupInfo {
         if (group.member_cnt < 0) return KafkaError.GroupListError;
+        
         const count = @as(usize, @intCast(group.member_cnt));
-        const members = try allocator.alloc(GroupMember, count);
+        var members = try allocator.alloc(GroupMember, count);
         errdefer allocator.free(members);
 
         // Initialize all members
-        for (members, 0..count) |*member, i| {
-            member.* = try GroupMember.init(allocator, &group.members[i]);
+        for (0..count) |i| {
+            members[i] = try GroupMember.init(allocator, &group.members[i]);
         }
 
         return GroupInfo{
@@ -488,11 +475,22 @@ const GroupInfo = struct {
     ) !void {
         _ = fmt;
         _ = options;
-        try writer.print("Group: {s}\n", .{self.group_id});
-        try writer.print("  State: {s}\n", .{self.state});
-        try writer.print("  Protocol Type: {s}\n", .{self.protocol_type});
-        try writer.print("  Protocol: {s}\n", .{self.protocol});
-        try writer.print("  Members ({d}):\n", .{self.members.len});
+        
+        try writer.print(
+            \\Group: {s}
+            \\  State: {s}
+            \\  Protocol Type: {s}
+            \\  Protocol: {s}
+            \\  Members ({d}):
+            \\
+        , .{
+            self.group_id,
+            self.state,
+            self.protocol_type,
+            self.protocol,
+            self.members.len,
+        });
+        
         for (self.members) |member| {
             try writer.print("    {}\n", .{member});
         }
@@ -528,19 +526,19 @@ pub fn getGroupInfo(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms
 
     const err = c.rd_kafka_list_groups(self.kafka_handle, null, &list, timeout_ms);
     if (err != 0) return KafkaError.GroupListError;
-    if (list == null) return &[_]GroupInfo{};
+    if (list == null or list.?.group_cnt < 0) return &[_]GroupInfo{};
 
-    if (list.?.group_cnt < 0) return KafkaError.GroupListError;
     const count = @as(usize, @intCast(list.?.group_cnt));
+    if (count == 0) return &[_]GroupInfo{};
 
-    const groups = try allocator.alloc(GroupInfo, count);
+    var groups = try allocator.alloc(GroupInfo, count);
     errdefer {
         for (groups) |*group| group.deinit();
         allocator.free(groups);
     }
 
-    for (groups, 0..count) |*group, i| {
-        group.* = try GroupInfo.init(allocator, &list.?.groups[i]);
+    for (0..count) |i| {
+        groups[i] = try GroupInfo.init(allocator, &list.?.groups[i]);
     }
 
     return groups;
