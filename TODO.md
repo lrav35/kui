@@ -2,3 +2,5 @@
 - make display better. maybe more grid based? fill in content when item is selected
 - clean this messy shit UP
 - add producer functionality
+
+testing
