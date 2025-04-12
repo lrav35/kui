@@ -1,6 +1,6 @@
 const std = @import("std");
 const c = @cImport({
-    @cInclude("librdkafka/rdkafka.h");
+    @cInclude("rdkafka.h");
 });
 const Mutex = std.Thread.Mutex;
 
@@ -137,7 +137,7 @@ pub const KafkaClient = struct {
         const year_day = epoch_day.calculateYearDay();
         const month_day = year_day.calculateMonthDay();
         const day_secs = ts.getDaySeconds();
-        
+
         return try std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
             year_day.year,
             @as(u8, @intCast(month_day.month.numeric())),
@@ -218,7 +218,7 @@ pub const KafkaClient = struct {
         var metadata: ?*c.rd_kafka_metadata_t = null;
         defer if (metadata != null) c.rd_kafka_metadata_destroy(metadata);
 
-        const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, null, &metadata, timeout_ms);
+        const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, null, @ptrCast(&metadata), timeout_ms);
 
         if (err != 0) return KafkaError.MetadataError;
         if (metadata == null or metadata.?.topic_cnt < 0) return &[_]TopicInfo{};
@@ -239,11 +239,7 @@ pub const KafkaClient = struct {
             if (std.mem.startsWith(u8, topic_name, "__")) continue;
 
             const partition_count = @max(0, topic.partition_cnt);
-            try topics.append(try TopicInfo.init(
-                allocator, 
-                topic_name, 
-                @intCast(partition_count)
-            ));
+            try topics.append(try TopicInfo.init(allocator, topic_name, @intCast(partition_count)));
         }
 
         return topics.toOwnedSlice();
@@ -436,7 +432,7 @@ const GroupInfo = struct {
         group: *allowzero const c.rd_kafka_group_info,
     ) !GroupInfo {
         if (group.member_cnt < 0) return KafkaError.GroupListError;
-        
+
         const count = @as(usize, @intCast(group.member_cnt));
         var members = try allocator.alloc(GroupMember, count);
         errdefer allocator.free(members);
@@ -475,7 +471,7 @@ const GroupInfo = struct {
     ) !void {
         _ = fmt;
         _ = options;
-        
+
         try writer.print(
             \\Group: {s}
             \\  State: {s}
@@ -490,7 +486,7 @@ const GroupInfo = struct {
             self.protocol,
             self.members.len,
         });
-        
+
         for (self.members) |member| {
             try writer.print("    {}\n", .{member});
         }
@@ -524,7 +520,7 @@ pub fn getGroupInfo(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms
     var list: ?*c.rd_kafka_group_list = null;
     errdefer if (list) |l| c.rd_kafka_group_list_destroy(l);
 
-    const err = c.rd_kafka_list_groups(self.kafka_handle, null, &list, timeout_ms);
+    const err = c.rd_kafka_list_groups(self.kafka_handle, null, @ptrCast(&list), timeout_ms);
     if (err != 0) return KafkaError.GroupListError;
     if (list == null or list.?.group_cnt < 0) return &[_]GroupInfo{};
 
