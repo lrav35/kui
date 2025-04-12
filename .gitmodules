@@ -1,3 +1,6 @@
 [submodule "dependencies/librdkafka"]
 	path = dependencies/librdkafka
 	url = git@github.com:confluentinc/librdkafka.git
+[submodule "dependencies/libvaxis"]
+	path = dependencies/libvaxis
+	url = git@github.com:rockorager/libvaxis.git
