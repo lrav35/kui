@@ -1,15 +1,14 @@
 .{
     .name = "kui",
-    .version = "0.0.1",
-    .fingerprint = 0xdde5a99c7e2f416a,
+    .version = "0.0.0",
 
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis#2ab3b46e89bced844b60601c7ab9961420d15994",
-            .hash = "1220de23a3240e503397ea579de4fd85db422f537e10036ef74717c50164475813ce",
+            .url = "git+https://github.com/rockorager/libvaxis#1fd920a7aea1bb040c7c028f4bbf0af2ea58e1d1",
+            .hash = "1220feaa655e14cbb4baf59fe746f09a17fc6949be46ad64dd5044982f4fc1bb57c7",
         },
     },
     .paths = .{
@@ -18,3 +17,4 @@
         "src",
     },
 }
+

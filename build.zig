@@ -16,38 +16,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const root_source_file = b.path("src/main.zig");
 
-    // Create librdkafka as a static library
-    const rdkafka = b.addStaticLibrary(.{
-        .name = "rdkafka",
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add all necessary C source files
-    const rdkafka_base_path = b.path("dependencies/librdkafka/src");
-    const rdkafka_sources = [_][]const u8{
-        "rdkafka.c",
-        "rdkafka_broker.c",
-        "rdkafka_msg.c",
-        "rdkafka_topic.c",
-    };
-
-    const c_flags = [_][]const u8{
-        "-fPIC",
-        "-DLIBRDKAFKA_STATICLIB",
-    };
-
-    for (rdkafka_sources) |src| {
-        const source_path = rdkafka_base_path.pathJoin(b.allocator, src) catch @panic("OOM");
-        rdkafka.addCSourceFile(.{
-            .file = source_path,
-            .flags = &c_flags,
-        });
-    }
-
-    rdkafka.linkLibC();
-    rdkafka.addIncludePath(rdkafka_base_path);
-
     const kui = b.addExecutable(.{
         .name = "kui",
         .root_source_file = root_source_file,
@@ -55,13 +23,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    kui.linkLibC();
+    kui.linkSystemLibrary("rdkafka");
+
     const deps = .{
         .vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize }),
     };
-
-    kui.linkLibC();
-    kui.linkLibrary(rdkafka);
-    kui.addIncludePath(rdkafka_base_path);
 
     kui.root_module.addImport("vaxis", deps.vaxis.module("vaxis"));
 
