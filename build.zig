@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
 
     kui.linkLibC();
     kui.linkSystemLibrary("rdkafka");
+    kui.addSystemIncludePath(.{ .cwd_relative = "/usr/include/librdkafka" });
 
     const deps = .{
         .vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize }),

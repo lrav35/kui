@@ -1,6 +1,7 @@
 .{
     .name = "kui",
     .version = "0.0.0",
+    .fingerprint = 0xdde5a99c7e2f416a,
 
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
