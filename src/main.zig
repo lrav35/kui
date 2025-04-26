@@ -1,238 +1,150 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const kafka = @import("kafka/client.zig");
-const vxfw = vaxis.vxfw;
-const c = @cImport({
-    @cInclude("librdkafka/rdkafka.h");
-});
+const Cell = vaxis.Cell;
+const TextInput = vaxis.widgets.TextInput;
+const border = vaxis.widgets.border;
 
-const Model = struct {
-    allocator: std.mem.Allocator,
-    topics: []kafka.TopicData,
-    consumer_state: ?kafka.GroupStateInfo,
-    selected_topic: usize = 0,
-    should_exit: std.atomic.Value(bool),
-
-    pub fn init(allocator: std.mem.Allocator, topics: []kafka.TopicInfo, state: ?kafka.GroupStateInfo) !*Model {
-        const topic_data = try allocator.alloc(kafka.TopicData, topics.len);
-        errdefer allocator.free(topic_data);
-
-        for (topics, 0..) |topic, i| {
-            topic_data[i] = try kafka.TopicData.init(allocator, topic.name);
-        }
-
-        const model = try allocator.create(Model);
-        errdefer allocator.destroy(model);
-        
-        model.* = .{
-            .allocator = allocator,
-            .topics = topic_data,
-            .consumer_state = state,
-            .should_exit = std.atomic.Value(bool).init(false),
-        };
-        
-        return model;
-    }
-
-    pub fn deinit(self: *Model) void {
-        for (self.topics) |*topic| {
-            topic.deinit();
-        }
-        self.allocator.free(self.topics);
-
-        self.should_exit.store(true, .release);
-        self.allocator.destroy(self);
-    }
-
-    pub fn widget(self: *Model) vxfw.Widget {
-        return .{
-            .userdata = self,
-            .eventHandler = Model.typeErasedEventHandler,
-            .drawFn = Model.typeErasedDrawFn,
-        };
-    }
-
-    fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
-        const self: *Model = @ptrCast(@alignCast(ptr));
-        switch (event) {
-            .key_press => |key| {
-                if (key.matches('c', .{ .ctrl = true })) {
-                    self.should_exit.store(true, .release);
-                    ctx.quit = true;
-                    return;
-                }
-                
-                if (self.topics.len > 0) {
-                    if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                        self.selected_topic = (self.selected_topic + 1) % self.topics.len;
-                        ctx.redraw = true;
-                    } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                        self.selected_topic = if (self.selected_topic == 0)
-                            self.topics.len - 1
-                        else
-                            self.selected_topic - 1;
-                        ctx.redraw = true;
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-
-    fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-        const self: *Model = @ptrCast(@alignCast(ptr));
-        const max_size = ctx.max.size();
-
-        // Create header text
-        const header = vxfw.Text{ .text = "Kafka Topics", .style = .{ .bold = true } };
-        const header_surf = try header.draw(ctx.withConstraints(
-            .{},
-            .{ .width = max_size.width, .height = 1 },
-        ));
-
-        // Calculate layout dimensions
-        const topic_list_width = @min(30, max_size.width / 3); // Adjust these values as needed
-        const messages_width = max_size.width - topic_list_width - 1; // -1 for separator
-        const content_height = max_size.height - 4; // Space for header and state info
-
-        // Create topic list text
-        var topic_text = std.ArrayList(u8).init(ctx.arena);
-        for (self.topics, 0..) |topic, i| {
-            const prefix = if (i == self.selected_topic) "> " else "  ";
-            try topic_text.appendSlice(prefix);
-            try topic_text.appendSlice(topic.name);
-            try topic_text.append('\n');
-        }
-
-        const topics_list = vxfw.RichText{
-            .text = &.{
-                .{ .text = topic_text.items },
-            },
-        };
-
-        const topics_surf = try topics_list.draw(ctx.withConstraints(
-            .{},
-            .{ .width = topic_list_width, .height = content_height },
-        ));
-
-        // Create messages text for selected topic
-        var messages_text = std.ArrayList(u8).init(ctx.arena);
-        if (self.topics.len > 0) {
-            const selected_topic = &self.topics[self.selected_topic];
-            try std.fmt.format(messages_text.writer(), "Messages for {s}:\n\n", .{selected_topic.name});
-
-            for (selected_topic.messages.items) |msg| {
-                try std.fmt.format(messages_text.writer(),
-                    \\Offset: {d}
-                    \\Key: {?s}
-                    \\Payload: {?s}
-                    \\-------------------
-                    \\
-                , .{ msg.offset, msg.key, msg.payload });
-            }
-        }
-
-        const messages_list = vxfw.RichText{
-            .text = &.{
-                .{ .text = messages_text.items },
-            },
-        };
-
-        const messages_surf = try messages_list.draw(ctx.withConstraints(
-            .{},
-            .{ .width = messages_width, .height = content_height },
-        ));
-
-        // Create vertical separator
-        var separator = std.ArrayList(u8).init(ctx.arena);
-        for (0..content_height) |_| {
-            try separator.appendSlice("│\n");
-        }
-        
-        const separator_text = vxfw.Text{ .text = separator.items };
-        const separator_surf = try separator_text.draw(ctx.withConstraints(
-            .{},
-            .{ .width = 1, .height = content_height },
-        ));
-
-        // Create state info text
-        var state_text = std.ArrayList(u8).init(ctx.arena);
-        try state_text.appendSlice("\nConsumer Group State:\n");
-        if (self.consumer_state) |state| {
-            try std.fmt.format(state_text.writer(), "Is Rebalancing: {}\nLast Rebalance: {d}\nState: {s}\n", .{
-                state.is_rebalancing,
-                state.last_rebalance_time,
-                state.current_state,
-            });
-        }
-
-        const state_info = vxfw.Text{ .text = state_text.items };
-        const state_surf = try state_info.draw(ctx.withConstraints(
-            .{},
-            .{ .width = max_size.width, .height = 4 },
-        ));
-
-        // Create layout with all components
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 5);
-        children[0] = .{ .surface = header_surf, .origin = .{ .row = 0, .col = 0 } };
-        children[1] = .{ .surface = topics_surf, .origin = .{ .row = 2, .col = 0 } };
-        children[2] = .{ .surface = separator_surf, .origin = .{ .row = 2, .col = topic_list_width } };
-        children[3] = .{ .surface = messages_surf, .origin = .{ .row = 2, .col = topic_list_width + 1 } };
-        children[4] = .{ .surface = state_surf, .origin = .{ .row = max_size.height - 4, .col = 0 } };
-
-        return .{
-            .size = max_size,
-            .widget = self.widget(),
-            .buffer = &.{},
-            .children = children,
-        };
-    }
+// This can contain internal events as well as Vaxis events.
+// Internal events can be posted into the same queue as vaxis events to allow
+// for a single event loop with exhaustive switching. Booya
+const Event = union(enum) {
+    key_press: vaxis.Key,
+    winsize: vaxis.Winsize,
+    focus_in,
+    foo: u8,
 };
-
-fn fetchMessages(consumer: *kafka.KafkaClient, model: *Model) !void {
-    while (!model.should_exit.load(.acquire)) {
-        if (try consumer.consumeMessage(model.allocator, 100)) |msg| {
-            for (model.topics) |*topic| {
-                if (std.mem.eql(u8, topic.name, msg.topic)) {
-                    try topic.messages.append(msg);
-                    break;
-                }
-            }
-        }
-        std.time.sleep(100 * std.time.ns_per_ms);
-    }
-}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var consumer = try kafka.KafkaClient.init(allocator, .Consumer, "my-group-id");
-    defer consumer.deinit();
-
-    const topics = try consumer.getTopics(allocator, 5000);
     defer {
-        for (topics) |*topic| topic.deinit();
-        allocator.free(topics);
+        const deinit_status = gpa.deinit();
+        //fail test; can't try in defer as defer is executed after we return
+        if (deinit_status == .leak) {
+            std.log.err("memory leak", .{});
+        }
     }
+    const alloc = gpa.allocator();
 
-    try consumer.subscribe(topics);
+    // Initialize a tty
+    var tty = try vaxis.Tty.init();
+    defer tty.deinit();
 
-    const info = try kafka.getConsumerGroupInfo(&consumer, allocator, 5000);
-    defer {
-        for (info.groups) |*group| group.deinit();
-        allocator.free(info.groups);
+    // Initialize Vaxis
+    var vx = try vaxis.init(alloc, .{});
+    // deinit takes an optional allocator. If your program is exiting, you can
+    // choose to pass a null allocator to save some exit time.
+    defer vx.deinit(alloc, tty.anyWriter());
+
+    // The event loop requires an intrusive init. We create an instance with
+    // stable pointers to Vaxis and our TTY, then init the instance. Doing so
+    // installs a signal handler for SIGWINCH on posix TTYs
+    //
+    // This event loop is thread safe. It reads the tty in a separate thread
+    var loop: vaxis.Loop(Event) = .{
+        .tty = &tty,
+        .vaxis = &vx,
+    };
+    try loop.init();
+
+    // Start the read loop. This puts the terminal in raw mode and begins
+    // reading user input
+    try loop.start();
+    defer loop.stop();
+
+    // Optionally enter the alternate screen
+    try vx.enterAltScreen(tty.anyWriter());
+
+    // We'll adjust the color index every keypress for the border
+    var color_idx: u8 = 0;
+
+    // init our text input widget. The text input widget needs an allocator to
+    // store the contents of the input
+    var text_input = TextInput.init(alloc, &vx.unicode);
+    defer text_input.deinit();
+
+    // Sends queries to terminal to detect certain features. This should always
+    // be called after entering the alt screen, if you are using the alt screen
+    try vx.queryTerminal(tty.anyWriter(), 1 * std.time.ns_per_s);
+
+    while (true) {
+        // nextEvent blocks until an event is in the queue
+        const event = loop.nextEvent();
+        // exhaustive switching ftw. Vaxis will send events if your Event enum
+        // has the fields for those events (ie "key_press", "winsize")
+        switch (event) {
+            .key_press => |key| {
+                color_idx = switch (color_idx) {
+                    255 => 0,
+                    else => color_idx + 1,
+                };
+                if (key.matches('c', .{ .ctrl = true })) {
+                    break;
+                } else if (key.matches('l', .{ .ctrl = true })) {
+                    vx.queueRefresh();
+                } else {
+                    try text_input.update(.{ .key_press = key });
+                }
+            },
+
+            // winsize events are sent to the application to ensure that all
+            // resizes occur in the main thread. This lets us avoid expensive
+            // locks on the screen. All applications must handle this event
+            // unless they aren't using a screen (IE only detecting features)
+            //
+            // The allocations are because we keep a copy of each cell to
+            // optimize renders. When resize is called, we allocated two slices:
+            // one for the screen, and one for our buffered screen. Each cell in
+            // the buffered screen contains an ArrayList(u8) to be able to store
+            // the grapheme for that cell. Each cell is initialized with a size
+            // of 1, which is sufficient for all of ASCII. Anything requiring
+            // more than one byte will incur an allocation on the first render
+            // after it is drawn. Thereafter, it will not allocate unless the
+            // screen is resized
+            .winsize => |ws| try vx.resize(alloc, tty.anyWriter(), ws),
+            else => {},
+        }
+
+        // vx.window() returns the root window. This window is the size of the
+        // terminal and can spawn child windows as logical areas. Child windows
+        // cannot draw outside of their bounds
+        const win = vx.window();
+
+        // Clear the entire space because we are drawing in immediate mode.
+        // vaxis double buffers the screen. This new frame will be compared to
+        // the old and only updated cells will be drawn
+        win.clear();
+
+        // Create a style
+        const style: vaxis.Style = .{
+            .fg = .{ .index = color_idx },
+        };
+
+        // Create a bordered child window
+        const child = win.child(.{
+            .x_off = win.width / 2 - 20,
+            .y_off = win.height / 2 - 3,
+            .width = 40,
+            .height = 3,
+            .border = .{
+                .where = .all,
+                .style = style,
+            },
+        });
+
+        // Draw the text_input in the child window
+        text_input.draw(child);
+
+        // Render the screen. Using a buffered writer will offer much better
+        // performance, but is not required
+        try vx.render(tty.anyWriter());
     }
-
-    var app = try vxfw.App.init(allocator);
-    defer app.deinit();
-
-    const model = try Model.init(allocator, topics, info.state_info);
-    defer model.deinit();
-
-    var thread = try std.Thread.spawn(.{}, fetchMessages, .{ &consumer, model });
-    defer thread.join();
-
-    try app.run(model.widget(), .{});
 }
+
+
+
+
+
+
+
+
+
