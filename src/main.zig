@@ -1,5 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const kafka = @import("kafka/client.zig");
 const Cell = vaxis.Cell;
 const TextInput = vaxis.widgets.TextInput;
 const border = vaxis.widgets.border;
@@ -11,7 +12,13 @@ const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
     focus_in,
-    foo: u8,
+    consumer_message: ConsumerMessage,
+};
+
+const ConsumerMessage = struct {
+    topic: ?[]const u8,
+    msg_id: ?[]const u8,
+    data: ?[]const u8,
 };
 
 pub fn main() !void {
@@ -65,6 +72,24 @@ pub fn main() !void {
     // Sends queries to terminal to detect certain features. This should always
     // be called after entering the alt screen, if you are using the alt screen
     try vx.queryTerminal(tty.anyWriter(), 1 * std.time.ns_per_s);
+
+    // Kafka stuff
+    var consumer = try kafka.KafkaClient.init(alloc, .Consumer, "my-group-id");
+    defer consumer.deinit();
+
+    const topics = try consumer.getTopics(alloc, 5000);
+    defer {
+        for (topics) |*topic| topic.deinit();
+        alloc.free(topics);
+    }
+
+    try consumer.subscribe(topics);
+
+    const info = try kafka.getConsumerGroupInfo(&consumer, alloc, 5000);
+    defer {
+        for (info.groups) |*group| group.deinit();
+        alloc.free(info.groups);
+    }
 
     while (true) {
         // nextEvent blocks until an event is in the queue
@@ -139,12 +164,3 @@ pub fn main() !void {
         try vx.render(tty.anyWriter());
     }
 }
-
-
-
-
-
-
-
-
-

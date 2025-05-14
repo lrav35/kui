@@ -2,6 +2,8 @@ const std = @import("std");
 const c = @cImport({
     @cInclude("rdkafka.h");
 });
+const vaxis = @import("vaxis");
+const main = @import("root");
 const Mutex = std.Thread.Mutex;
 
 pub const TimestampType = enum {
@@ -245,6 +247,64 @@ pub const KafkaClient = struct {
         return topics.toOwnedSlice();
     }
 };
+
+pub const KafkaContext = struct {
+    should_quit: std.atomic.Value(bool),
+    loop: *vaxis.Loop(main.Event),
+    consumer: *KafkaClient,
+    allocator: std.mem.Allocator,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        loop: *vaxis.Loop(vaxis.Event),
+    ) !KafkaContext {
+        var consumer = try KafkaClient.init(allocator, .Consumer, "kui-group-id");
+        errdefer consumer.deinit();
+
+        const topics = try consumer.getTopics(allocator, 5000);
+        defer {
+            for (topics) |*topic| topic.deinit();
+            allocator.free(topics);
+        }
+
+        try consumer.subscribe(topics);
+
+        return .{
+            .should_quit = std.atomic.Value(bool).init(false),
+            .loop = loop,
+            .consumer = consumer,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.consumer.deinit();
+    }
+};
+
+pub fn kafkaThread(context: *KafkaContext) !void {
+    const time_out_ms = 100;
+
+    while (!context.should_quit.load(.acquire)) {
+
+        // create poll method or use something I alread have
+        if (try context.consumer.poll(time_out_ms)) |message| {
+            defer message.deinit();
+
+            const msg_copy = try context.allocator.dupe(u8, message.value);
+            const id_copy = try context.allocator.dupe(u8, message.id);
+            const topic_copy = try context.allocator.dupe(u8, message.topic);
+
+            try context.loop.postEvent(.{
+                .consumer_messsage = .{
+                    .topic = topic_copy,
+                    .msg_id = id_copy,
+                    .data = msg_copy,
+                },
+            });
+        }
+    }
+}
 
 pub const TopicData = struct {
     name: []const u8,
