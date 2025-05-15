@@ -21,6 +21,70 @@ const ConsumerMessage = struct {
     data: ?[]const u8,
 };
 
+const StoredMessage = struct {
+    topic: []u8,
+    msg_id: []u8,
+    data: []u8,
+    timestamp: i64, // Unix timestamp in seconds
+
+    // allocator used to own the slices above
+    allocator: std.mem.Allocator,
+
+    pub fn create(
+        alloc: std.mem.Allocator,
+        transient_msg: ConsumerMessage,
+    ) !StoredMessage {
+        const topic_dup = if (transient_msg.topic) |t| try alloc.dupe(u8, t) else try alloc.dupe(u8, "");
+        errdefer alloc.free(topic_dup);
+
+        const msg_id_dup = if (transient_msg.msg_id) |id| try alloc.dupe(u8, id) else try alloc.dupe(u8, "");
+        errdefer alloc.free(msg_id_dup);
+
+        const data_dup = if (transient_msg.data) |d| try alloc.dupe(u8, d) else try alloc.dupe(u8, "");
+        errdefer alloc.free(data_dup);
+
+        return StoredMessage{
+            .topic = topic_dup,
+            .msg_id = msg_id_dup,
+            .data = data_dup,
+            .timestamp = std.time.timestamp(),
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *StoredMessage) void {
+        self.allocator.free(self.topic);
+        self.allocator.free(self.msg_id);
+        self.allocator.free(self.data);
+        self.* = undefined;
+    }
+};
+
+const AppState = struct {
+    messages: std.ArrayList(StoredMessage),
+    allocator: std.mem.Allocator,
+
+    pub fn init(alloc: std.mem.Allocator) AppState {
+        return AppState{
+            .messages = std.ArrayList(StoredMessage).init(alloc),
+            .allocator = alloc,
+        };
+    }
+
+    pub fn deinit(self: *AppState) void {
+        for (self.messages.items) |*msg| {
+            msg.deinit();
+        }
+        self.messages.deinit();
+    }
+
+    pub fn addMessage(self: *AppState, transient_msg: ConsumerMessage) !void {
+        const stored_msg = try StoredMessage.create(self.allocator, transient_msg);
+        errdefer stored_msg.deinit();
+        try self.messages.append(stored_msg);
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -73,23 +137,21 @@ pub fn main() !void {
     // be called after entering the alt screen, if you are using the alt screen
     try vx.queryTerminal(tty.anyWriter(), 1 * std.time.ns_per_s);
 
+    var app_state = AppState.init(alloc);
+    defer app_state.deinit();
+
     // Kafka stuff
-    var consumer = try kafka.KafkaClient.init(alloc, .Consumer, "my-group-id");
-    defer consumer.deinit();
+    var kafka_ctx = try kafka.KafkaContext.init(alloc, loop);
+    defer kafka_ctx.deinit();
 
-    const topics = try consumer.getTopics(alloc, 5000);
+    const kafka_thread = try std.Thread.spawn(.{}, kafka.kafkaThread, .{&kafka_ctx});
     defer {
-        for (topics) |*topic| topic.deinit();
-        alloc.free(topics);
+        kafka_ctx.should_quit.store(true, .release);
+        kafka_thread.join();
     }
 
-    try consumer.subscribe(topics);
-
-    const info = try kafka.getConsumerGroupInfo(&consumer, alloc, 5000);
-    defer {
-        for (info.groups) |*group| group.deinit();
-        alloc.free(info.groups);
-    }
+    // var message_scroll_offset: usize = 0; // For scrolling the message list
+    // const MAX_DISPLAY_MESSAGES = 10; // How many messages to show at once
 
     while (true) {
         // nextEvent blocks until an event is in the queue
@@ -106,6 +168,23 @@ pub fn main() !void {
                     break;
                 } else if (key.matches('l', .{ .ctrl = true })) {
                     vx.queueRefresh();
+                    //TODO: scrolling functionality?...
+                    // } else if (key.matches('k', .{})) { // 'k' to scroll up messages
+                    //     if (message_scroll_offset > 0) {
+                    //         message_scroll_offset -= 1;
+                    //     }
+                    // } else if (key.matches('j', .{})) { // 'j' to scroll down messages
+                    //     // Ensure we don't scroll past the available messages,
+                    //     // considering how many are displayed at once.
+                    //     if (app_state.messages.items.len > 0) {
+                    //         const max_scroll = if (app_state.messages.items.len > MAX_DISPLAY_MESSAGES)
+                    //             app_state.messages.items.len - MAX_DISPLAY_MESSAGES
+                    //         else
+                    //             0;
+                    //         if (message_scroll_offset < max_scroll) {
+                    //             message_scroll_offset += 1;
+                    //         }
+                    //     }
                 } else {
                     try text_input.update(.{ .key_press = key });
                 }
@@ -126,7 +205,27 @@ pub fn main() !void {
             // after it is drawn. Thereafter, it will not allocate unless the
             // screen is resized
             .winsize => |ws| try vx.resize(alloc, tty.anyWriter(), ws),
-            else => {},
+            .consumer_message => |transient_cm| {
+                try app_state.addMessage(transient_cm);
+
+                if (transient_cm.topic) |t| alloc.free(t);
+                if (transient_cm.msg_id) |id| alloc.free(id);
+                if (transient_cm.data) |d| alloc.free(d);
+
+                //TODO: could have some autoscroll here
+                // // Auto-scroll to the newest message if not already scrolled by user
+                // if (app_state.messages.items.len > MAX_DISPLAY_MESSAGES) {
+                //     message_scroll_offset = app_state.messages.items.len - MAX_DISPLAY_MESSAGES;
+                // } else {
+                //     message_scroll_offset = 0;
+                // }
+
+                vx.queueRefresh(); // Trigger a redraw
+            },
+            .focus_in => {
+                // Vaxis might send this, typically you'd queue a refresh
+                vx.queueRefresh();
+            },
         }
 
         // vx.window() returns the root window. This window is the size of the

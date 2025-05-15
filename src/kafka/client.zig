@@ -289,6 +289,8 @@ pub fn kafkaThread(context: *KafkaContext) !void {
 
         // create poll method or use something I alread have
         if (try context.consumer.poll(time_out_ms)) |message| {
+
+            // need a deinit that frees all of the message data
             defer message.deinit();
 
             const msg_copy = try context.allocator.dupe(u8, message.value);
