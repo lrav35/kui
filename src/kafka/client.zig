@@ -13,6 +13,7 @@ pub const TimestampType = enum {
 };
 
 pub const KafkaMessage = struct {
+    //TODO: do i want to change what is optional what is not? idk
     payload: ?[]const u8,
     key: ?[]const u8,
     topic: []const u8,
@@ -23,7 +24,13 @@ pub const KafkaMessage = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *const KafkaMessage) void {
+        if (self.payload) |p| self.allocator.free(p);
+        if (self.key) |k| self.allocator.free(k);
+        self.allocator.free(self.topic);
+        self.allocator.free(self.partition);
+        self.allocator.free(self.offset);
         self.allocator.free(self.timestamp);
+        self.allocator.free(self.timestampType);
     }
 };
 
@@ -155,24 +162,56 @@ pub const KafkaClient = struct {
             return KafkaError.ConsumerError;
         }
 
-        const message = c.rd_kafka_consumer_poll(self.kafka_handle.?, timeout_ms);
-        if (message == null) {
+        const rd_message = c.rd_kafka_consumer_poll(self.kafka_handle.?, timeout_ms);
+        if (rd_message == null) {
             return null;
         }
-        defer c.rd_kafka_message_destroy(message);
+        defer c.rd_kafka_message_destroy(rd_message);
 
-        if (message.*.err != c.RD_KAFKA_RESP_ERR_NO_ERROR) {
-            std.debug.print("Consumer error: {s}\n", .{c.rd_kafka_err2str(message.*.err)});
-            if (message.*.rkt != null) {
-                std.debug.print("Failed topic: {s}\n", .{c.rd_kafka_topic_name(message.*.rkt)});
+        if (rd_message.*.err != c.RD_KAFKA_RESP_ERR_NO_ERROR) {
+            std.debug.print("Consumer poll error: {s} ({s})\n", .{
+                c.rd_kafka_err2str(rd_message.*.err),
+                c.rd_kafka_err2name(rd_message.*.err),
+            });
+            if (rd_message.*.rkt != null) {
+                std.debug.print("  Topic: {s}\n", .{c.rd_kafka_topic_name(rd_message.*.rkt)});
+            }
+            if (rd_message.*.err == c.RD_KAFKA_RESP_ERR__PARTITION_EOF) {
+                return null; // Not an application error, just no more messages for now
             }
             return null;
         }
 
-        const topic_name = c.rd_kafka_topic_name(message.*.rkt);
+        var payload_copy: ?[]const u8 = null;
+        if (rd_message.*.payload != null and rd_message.*.len > 0) {
+            const payload_slice = @as([*]const u8, @ptrCast(rd_message.*.payload))[0..rd_message.*.len];
+            payload_copy = try allocator.dupe(u8, payload_slice);
+        }
+
+        var key_copy: ?[]const u8 = null;
+        if (rd_message.*.key != null and rd_message.*.key_len > 0) {
+            const key_slice = @as([*]const u8, @ptrCast(rd_message.*.key))[0..rd_message.*.key_len];
+            key_copy = try allocator.dupe(u8, key_slice);
+        }
+
+        const topic_name = c.rd_kafka_topic_name(rd_message.*.rkt);
+        const topic_name_slice = std.mem.span(topic_name);
+        const topic_copy = try allocator.dupe(u8, topic_name_slice);
+
+        var partition_copy: ?[]const u8 = null;
+        if (rd_message.*.partition != null and rd_message.*.len > 0) {
+            const partition_slice = @as([*]const u8, @ptrCast(rd_message.*.partition))[0..rd_message.*.len];
+            partition_copy = try allocator.dupe(u8, partition_slice);
+        }
+
+        var offset_copy: ?[]const u8 = null;
+        if (rd_message.*.offset != null and rd_message.*.len > 0) {
+            const offset_slice = @as([*]const u8, @ptrCast(rd_message.*.offset))[0..rd_message.*.len];
+            offset_copy = try allocator.dupe(u8, offset_slice);
+        }
 
         var timestamp_type: c.rd_kafka_timestamp_type_t = c.RD_KAFKA_TIMESTAMP_NOT_AVAILABLE;
-        const timestamp = c.rd_kafka_message_timestamp(message, &timestamp_type);
+        const timestamp = c.rd_kafka_message_timestamp(rd_message, &timestamp_type);
 
         const ts_type = switch (timestamp_type) {
             c.RD_KAFKA_TIMESTAMP_CREATE_TIME => TimestampType.CREATE,
@@ -185,17 +224,11 @@ pub const KafkaClient = struct {
         const timestamp_copy = try allocator.dupe(u8, formatted_time);
 
         return KafkaMessage{
-            .payload = if (message.*.payload != null)
-                @as([*]const u8, @ptrCast(message.*.payload))[0..message.*.len]
-            else
-                null,
-            .key = if (message.*.key != null)
-                @as([*]const u8, @ptrCast(message.*.key))[0..message.*.key_len]
-            else
-                null,
-            .topic = std.mem.span(topic_name),
-            .partition = message.*.partition,
-            .offset = message.*.offset,
+            .payload = payload_copy,
+            .key = key_copy,
+            .topic = topic_copy,
+            .partition = partition_copy,
+            .offset = offset_copy,
             .timestamp = timestamp_copy,
             .timestampType = ts_type,
             .allocator = allocator,
@@ -283,25 +316,30 @@ pub const KafkaContext = struct {
 };
 
 pub fn kafkaThread(context: *KafkaContext) !void {
-    const time_out_ms = 100;
+    const time_out_ms: i32 = 100;
 
     while (!context.should_quit.load(.acquire)) {
-
-        // create poll method or use something I alread have
-        if (try context.consumer.poll(time_out_ms)) |message| {
-
-            // need a deinit that frees all of the message data
+        const opt_kafka_msg = try context.consumer.consumeMessage(context.allocator, time_out_ms);
+        if (opt_kafka_msg) |message| {
             defer message.deinit();
 
-            const msg_copy = try context.allocator.dupe(u8, message.value);
-            const id_copy = try context.allocator.dupe(u8, message.id);
+            const msg_copy = try context.allocator.dupe(u8, message.payload);
+            const id_copy = try context.allocator.dupe(u8, message.key);
             const topic_copy = try context.allocator.dupe(u8, message.topic);
+            const partition_copy = try context.allocator.dupe(u8, message.partition);
+            const offset_copy = try context.allocator.dupe(u8, message.offset);
+            const timestamp_copy = try context.allocator.dupe(u8, message.timestamp);
+            const TimestampType_copy = try context.allocator.dupe(u8, message.timestampType);
 
             try context.loop.postEvent(.{
                 .consumer_messsage = .{
                     .topic = topic_copy,
                     .msg_id = id_copy,
                     .data = msg_copy,
+                    .partition = partition_copy,
+                    .offset = offset_copy,
+                    .timestamp = timestamp_copy,
+                    .timestampType = TimestampType_copy,
                 },
             });
         }

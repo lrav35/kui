@@ -19,6 +19,12 @@ const ConsumerMessage = struct {
     topic: ?[]const u8,
     msg_id: ?[]const u8,
     data: ?[]const u8,
+    partition: ?[]const u8,
+    offset: ?[]const u8,
+    timestamp: ?[]const u8,
+    timestampType: ?[]const u8,
+
+    //TODO: do i need a deinit here? maybe soon
 };
 
 const StoredMessage = struct {
