@@ -6,13 +6,13 @@ const vaxis = @import("vaxis");
 const main = @import("root");
 const Mutex = std.Thread.Mutex;
 
-pub const TimestampType = enum {
+const TimestampType = enum {
     CREATE,
     LOG_APPEND,
     N_A,
 };
 
-pub const KafkaMessage = struct {
+const KafkaMessage = struct {
     //TODO: do i want to change what is optional what is not? idk
     payload: ?[]const u8,
     key: ?[]const u8,
@@ -34,7 +34,7 @@ pub const KafkaMessage = struct {
     }
 };
 
-pub const KafkaError = error{
+const KafkaError = error{
     ConfigError,
     ClientCreationError,
     MetadataError,
@@ -46,12 +46,12 @@ pub const KafkaError = error{
     TopicNameTooLong,
 };
 
-pub const ClientType = enum {
+const ClientType = enum {
     Producer,
     Consumer,
 };
 
-pub const KafkaClient = struct {
+const KafkaClient = struct {
     kafka_handle: ?*c.rd_kafka_t,
     client_type: ClientType,
     group_state: ?*ConsumerGroupState,
@@ -75,7 +75,6 @@ pub const KafkaClient = struct {
         // If it's a consumer, set the group.id and auto.offset.reset
         if (client_type == .Consumer) {
             if (group_id) |id| {
-                // Need to convert to null-terminated string
                 const id_z = try allocator.dupeZ(u8, id);
                 defer allocator.free(id_z);
                 try setConfig(conf, "group.id", id_z, &errstr);
@@ -115,7 +114,7 @@ pub const KafkaClient = struct {
         }
     }
 
-    pub fn subscribe(self: *KafkaClient, topics: []TopicInfo) !void {
+    fn subscribe(self: *KafkaClient, topics: []TopicInfo) !void {
         if (self.client_type != .Consumer) {
             return KafkaError.ConsumerError;
         }
@@ -157,7 +156,7 @@ pub const KafkaClient = struct {
         });
     }
 
-    pub fn consumeMessage(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) !?KafkaMessage {
+    fn consumeMessage(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) !?KafkaMessage {
         if (self.client_type != .Consumer) {
             return KafkaError.ConsumerError;
         }
@@ -235,21 +234,20 @@ pub const KafkaClient = struct {
         };
     }
 
-    // Get metadata for all topics
-    pub fn getMetadata(self: *KafkaClient, timeout_ms: i32) !void {
-        var metadata: ?*c.rd_kafka_metadata_t = null;
-        const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, // all_topics
-            null, // only_topic
-            &metadata, timeout_ms);
+    // pub fn getMetadata(self: *KafkaClient, timeout_ms: i32) !void {
+    //     var metadata: ?*c.rd_kafka_metadata_t = null;
+    //     const err = c.rd_kafka_metadata(self.kafka_handle.?, 1, // all_topics
+    //         null, // only_topic
+    //         &metadata, timeout_ms);
+    //
+    //     if (err != 0) {
+    //         return KafkaError.MetadataError;
+    //     }
+    //
+    //     defer c.rd_kafka_metadata_destroy(metadata);
+    // }
 
-        if (err != 0) {
-            return KafkaError.MetadataError;
-        }
-
-        defer c.rd_kafka_metadata_destroy(metadata);
-    }
-
-    pub fn getTopics(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) ![]TopicInfo {
+    fn getTopics(self: *KafkaClient, allocator: std.mem.Allocator, timeout_ms: i32) ![]TopicInfo {
         var metadata: ?*c.rd_kafka_metadata_t = null;
         defer if (metadata != null) c.rd_kafka_metadata_destroy(metadata);
 
@@ -333,6 +331,7 @@ pub fn kafkaThread(context: *KafkaContext) !void {
 
             try context.loop.postEvent(.{
                 .consumer_messsage = .{
+                    .allocator = context.allocator,
                     .topic = topic_copy,
                     .msg_id = id_copy,
                     .data = msg_copy,

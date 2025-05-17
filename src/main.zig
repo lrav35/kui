@@ -5,9 +5,6 @@ const Cell = vaxis.Cell;
 const TextInput = vaxis.widgets.TextInput;
 const border = vaxis.widgets.border;
 
-// This can contain internal events as well as Vaxis events.
-// Internal events can be posted into the same queue as vaxis events to allow
-// for a single event loop with exhaustive switching. Booya
 const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
@@ -16,6 +13,7 @@ const Event = union(enum) {
 };
 
 const ConsumerMessage = struct {
+    allocator: std.mem.Allocator,
     topic: ?[]const u8,
     msg_id: ?[]const u8,
     data: ?[]const u8,
@@ -24,55 +22,24 @@ const ConsumerMessage = struct {
     timestamp: ?[]const u8,
     timestampType: ?[]const u8,
 
-    //TODO: do i need a deinit here? maybe soon
-};
-
-const StoredMessage = struct {
-    topic: []u8,
-    msg_id: []u8,
-    data: []u8,
-    timestamp: i64, // Unix timestamp in seconds
-
-    // allocator used to own the slices above
-    allocator: std.mem.Allocator,
-
-    pub fn create(
-        alloc: std.mem.Allocator,
-        transient_msg: ConsumerMessage,
-    ) !StoredMessage {
-        const topic_dup = if (transient_msg.topic) |t| try alloc.dupe(u8, t) else try alloc.dupe(u8, "");
-        errdefer alloc.free(topic_dup);
-
-        const msg_id_dup = if (transient_msg.msg_id) |id| try alloc.dupe(u8, id) else try alloc.dupe(u8, "");
-        errdefer alloc.free(msg_id_dup);
-
-        const data_dup = if (transient_msg.data) |d| try alloc.dupe(u8, d) else try alloc.dupe(u8, "");
-        errdefer alloc.free(data_dup);
-
-        return StoredMessage{
-            .topic = topic_dup,
-            .msg_id = msg_id_dup,
-            .data = data_dup,
-            .timestamp = std.time.timestamp(),
-            .allocator = alloc,
-        };
-    }
-
-    pub fn deinit(self: *StoredMessage) void {
-        self.allocator.free(self.topic);
-        self.allocator.free(self.msg_id);
-        self.allocator.free(self.data);
-        self.* = undefined;
+    pub fn deinit(self: *const ConsumerMessage) void {
+        if (self.topic) |s| self.allocator.free(s);
+        if (self.msg_id) |s| self.allocator.free(s);
+        if (self.data) |s| self.allocator.free(s);
+        if (self.partition) |s| self.allocator.free(s);
+        if (self.offset) |s| self.allocator.free(s);
+        if (self.timestamp) |s| self.allocator.free(s);
+        if (self.timestampType) |s| self.allocator.free(s);
     }
 };
 
 const AppState = struct {
-    messages: std.ArrayList(StoredMessage),
+    messages: std.ArrayList(ConsumerMessage),
     allocator: std.mem.Allocator,
 
     pub fn init(alloc: std.mem.Allocator) AppState {
         return AppState{
-            .messages = std.ArrayList(StoredMessage).init(alloc),
+            .messages = std.ArrayList(ConsumerMessage).init(alloc),
             .allocator = alloc,
         };
     }
@@ -82,12 +49,6 @@ const AppState = struct {
             msg.deinit();
         }
         self.messages.deinit();
-    }
-
-    pub fn addMessage(self: *AppState, transient_msg: ConsumerMessage) !void {
-        const stored_msg = try StoredMessage.create(self.allocator, transient_msg);
-        errdefer stored_msg.deinit();
-        try self.messages.append(stored_msg);
     }
 };
 
@@ -211,12 +172,8 @@ pub fn main() !void {
             // after it is drawn. Thereafter, it will not allocate unless the
             // screen is resized
             .winsize => |ws| try vx.resize(alloc, tty.anyWriter(), ws),
-            .consumer_message => |transient_cm| {
-                try app_state.addMessage(transient_cm);
-
-                if (transient_cm.topic) |t| alloc.free(t);
-                if (transient_cm.msg_id) |id| alloc.free(id);
-                if (transient_cm.data) |d| alloc.free(d);
+            .consumer_message => |kafka_msg| {
+                try app_state.messages.append(kafka_msg);
 
                 //TODO: could have some autoscroll here
                 // // Auto-scroll to the newest message if not already scrolled by user
